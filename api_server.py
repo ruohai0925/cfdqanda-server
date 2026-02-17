@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # --- 新增这两行 ---
 from dotenv import load_dotenv
@@ -12,6 +12,9 @@ from typing import Optional
 import logging
 import jwt
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # --- 1. 初始化与配置 ---
 
@@ -81,6 +84,11 @@ async def verify_jwt(credentials: HTTPAuthorizationCredentials = Depends(securit
 # 创建 FastAPI 应用实例
 app = FastAPI()
 
+# --- Rate Limiting ---
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # --- 在这里添加 CORS 中间件 ---
 
 # 1. 定义一个 "白名单" 列表，包含所有我们允许的来源
@@ -126,7 +134,8 @@ class FeedbackRequest(BaseModel):
 # --- 3. 创建 API 端点 (Endpoint) ---
 
 @app.post("/api/v1/simulations")
-async def create_simulation_task(request: SimulationRequest, user_id: str = Depends(verify_jwt)):
+@limiter.limit("5/minute")
+async def create_simulation_task(request: Request, sim_request: SimulationRequest, user_id: str = Depends(verify_jwt)):
     """
     接收一个新的仿真请求，并将其作为任务插入数据库，状态为 'queued'
     Requires a valid Supabase JWT in the Authorization header.
@@ -135,13 +144,13 @@ async def create_simulation_task(request: SimulationRequest, user_id: str = Depe
     try:
         # 构建插入数据
         insert_data = {
-            'prompt': request.prompt,
+            'prompt': sim_request.prompt,
             'user_id': user_id,
             'status': 'queued'  # 将初始状态明确设置为 '排队中'
         }
         # 如果用户提供了 LLM 配置，写入 llm_config JSONB 列
-        if request.llm_config:
-            insert_data['llm_config'] = request.llm_config.model_dump(exclude_none=True)
+        if sim_request.llm_config:
+            insert_data['llm_config'] = sim_request.llm_config.model_dump(exclude_none=True)
 
         # 将新任务插入到 'simulations' 表中
         response = supabase.table('simulations').insert(insert_data).execute()
@@ -227,7 +236,8 @@ async def get_file_tree(job_id: int):
 # --- 修改 api_server.py 中的 submit_feedback 函数 ---
 
 @app.post("/api/v1/simulations/{job_id}/feedback")
-async def submit_feedback(job_id: int, request: FeedbackRequest, user_id: str = Depends(verify_jwt)):
+@limiter.limit("10/minute")
+async def submit_feedback(request: Request, job_id: int, fb_request: FeedbackRequest, user_id: str = Depends(verify_jwt)):
     """
     提交文件反馈。
     Requires a valid Supabase JWT in the Authorization header.
@@ -247,19 +257,19 @@ async def submit_feedback(job_id: int, request: FeedbackRequest, user_id: str = 
             raise HTTPException(status_code=403, detail="Permission denied")
 
         # 3. 验证大小 (限制 5KB)
-        feedback_size = len(request.feedback_content.encode('utf-8'))
+        feedback_size = len(fb_request.feedback_content.encode('utf-8'))
         if feedback_size > 5120 or feedback_size == 0:
             raise HTTPException(status_code=400, detail="Invalid feedback size")
 
         # 4. 构建文件名
         # 逻辑：原文件 "output/log.blockMesh" -> 反馈文件 "output/log.blockMesh_feedback"
-        feedback_file_path = f"{request.file_path}_feedback"
+        feedback_file_path = f"{fb_request.file_path}_feedback"
 
         # 5. Path traversal protection: ensure the resolved path stays within runs/{job_id}/
         job_base_dir = Path(FOAM_AGENT_DIR, "runs", str(job_id)).resolve()
         resolved_feedback_path = (job_base_dir / feedback_file_path).resolve()
         if not str(resolved_feedback_path).startswith(str(job_base_dir) + os.sep) and resolved_feedback_path != job_base_dir:
-            logger.warning(f"Path traversal attempt blocked: file_path='{request.file_path}' resolved to '{resolved_feedback_path}'")
+            logger.warning(f"Path traversal attempt blocked: file_path='{fb_request.file_path}' resolved to '{resolved_feedback_path}'")
             raise HTTPException(status_code=400, detail="Invalid file_path: path traversal is not allowed")
 
         # ==========================================
@@ -273,7 +283,7 @@ async def submit_feedback(job_id: int, request: FeedbackRequest, user_id: str = 
 
             # 写入文件
             with open(local_file_path, "w", encoding="utf-8") as f:
-                f.write(request.feedback_content)
+                f.write(fb_request.feedback_content)
 
             logger.info(f"Feedback saved locally to: {local_file_path}")
 
@@ -290,7 +300,7 @@ async def submit_feedback(job_id: int, request: FeedbackRequest, user_id: str = 
         try:
             supabase.storage.from_("simulation_results").upload(
                 path=storage_feedback_path,
-                file=request.feedback_content.encode('utf-8'),
+                file=fb_request.feedback_content.encode('utf-8'),
                 file_options={"content-type": "text/plain", "upsert": "true"}
             )
             logger.info(f"Feedback uploaded to Supabase: {storage_feedback_path}")
