@@ -4,6 +4,7 @@ import logging
 import subprocess
 import json
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from supabase import create_client, Client
 
@@ -32,6 +33,11 @@ logger.info(f"FOAM_AGENT_DIR resolved to: {FOAM_AGENT_DIR}")
 # Simulation subprocess timeout (seconds). Default: 3600 (1 hour).
 SIMULATION_TIMEOUT = int(os.environ.get("SIMULATION_TIMEOUT", "3600"))
 logger.info(f"Simulation timeout set to {SIMULATION_TIMEOUT} seconds")
+
+# Stale job recovery threshold (seconds). Default: 7200 (2 hours).
+# Jobs stuck in 'running' longer than this are reset to 'queued' on Worker startup.
+STALE_JOB_THRESHOLD = int(os.environ.get("STALE_JOB_THRESHOLD", "7200"))
+logger.info(f"Stale job threshold set to {STALE_JOB_THRESHOLD} seconds")
 
 # 从环境变量加载 Supabase 配置
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -217,7 +223,52 @@ def upload_directory_to_storage(local_dir, storage_base_path, supabase_client):
     return uploaded_count, failed_count
 
 
-# --- 3. 核心工作逻辑 ---
+# --- 3. Stale job recovery ---
+
+def recover_stale_jobs():
+    """
+    Recover jobs stuck in 'running' status due to a previous Worker crash.
+
+    If a job has been 'running' for longer than STALE_JOB_THRESHOLD seconds
+    (default: 2 hours), reset it to 'queued' so it can be picked up again.
+    Called once at Worker startup.
+    """
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=STALE_JOB_THRESHOLD)
+    threshold_iso = threshold.isoformat()
+
+    try:
+        response = (
+            supabase.table('simulations')
+            .select('id, updated_at')
+            .eq('status', 'running')
+            .lt('updated_at', threshold_iso)
+            .execute()
+        )
+
+        stale_jobs = response.data
+        if not stale_jobs:
+            logger.info("No stale jobs found during startup recovery.")
+            return
+
+        logger.warning(f"Found {len(stale_jobs)} stale job(s) stuck in 'running' status.")
+
+        for job in stale_jobs:
+            job_id = job['id']
+            logger.warning(
+                f"Recovering stale job {job_id} "
+                f"(updated_at: {job.get('updated_at', 'unknown')}). "
+                f"Resetting to 'queued'."
+            )
+            supabase.table('simulations').update(
+                {'status': 'queued'}
+            ).eq('id', job_id).execute()
+            logger.info(f"Stale job {job_id} reset to 'queued' successfully.")
+
+    except Exception as e:
+        logger.error(f"Error during stale job recovery: {e}", exc_info=True)
+
+
+# --- 4. 核心工作逻辑 ---
 
 def find_and_process_job():
     """
@@ -432,12 +483,15 @@ def find_and_process_job():
     return True
 
 
-# --- 3. 主循环 ---
+# --- 5. 主循环 ---
 
 def main_loop():
     """
     无限循环，不断地寻找并处理任务。
     """
+    # Recover any stale jobs from previous Worker crashes
+    recover_stale_jobs()
+
     logger.info("Worker started. Looking for jobs...")
     while True:
         try:
@@ -450,6 +504,6 @@ def main_loop():
             time.sleep(30) # 如果主循环出错，等待更长时间再重试
 
 
-# --- 4. 脚本入口 ---
+# --- 6. 脚本入口 ---
 if __name__ == "__main__":
     main_loop()
