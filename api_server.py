@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # --- 新增这两行 ---
@@ -254,11 +255,18 @@ async def submit_feedback(job_id: int, request: FeedbackRequest, user_id: str = 
         # 逻辑：原文件 "output/log.blockMesh" -> 反馈文件 "output/log.blockMesh_feedback"
         feedback_file_path = f"{request.file_path}_feedback"
 
+        # 5. Path traversal protection: ensure the resolved path stays within runs/{job_id}/
+        job_base_dir = Path(FOAM_AGENT_DIR, "runs", str(job_id)).resolve()
+        resolved_feedback_path = (job_base_dir / feedback_file_path).resolve()
+        if not str(resolved_feedback_path).startswith(str(job_base_dir) + os.sep) and resolved_feedback_path != job_base_dir:
+            logger.warning(f"Path traversal attempt blocked: file_path='{request.file_path}' resolved to '{resolved_feedback_path}'")
+            raise HTTPException(status_code=400, detail="Invalid file_path: path traversal is not allowed")
+
         # ==========================================
         # 写入本地 WSL 文件系统（Foam-Agent/runs/ 下）
         # ==========================================
         try:
-            local_file_path = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id), feedback_file_path)
+            local_file_path = str(resolved_feedback_path)
 
             # 确保父目录存在 (防止报错)
             os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
