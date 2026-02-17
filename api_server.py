@@ -1,5 +1,6 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # --- 新增这两行 ---
 from dotenv import load_dotenv
 load_dotenv()  # 自动读取同目录下的 .env 文件
@@ -8,6 +9,7 @@ from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import Optional
 import logging
+import jwt
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- 1. 初始化与配置 ---
@@ -39,6 +41,41 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 logger.info("Initializing Supabase client...")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 logger.info("Supabase client initialized successfully.")
+
+# --- JWT Authentication ---
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
+if not SUPABASE_JWT_SECRET:
+    logger.warning("SUPABASE_JWT_SECRET is not set. POST endpoints will reject all requests.")
+
+security = HTTPBearer()
+
+async def verify_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """
+    Verify Supabase JWT from Authorization header.
+    Returns the authenticated user_id (from token's 'sub' claim).
+    """
+    if not SUPABASE_JWT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="JWT verification is not configured (SUPABASE_JWT_SECRET missing)"
+        )
+
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated"
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
+        return user_id
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 # 创建 FastAPI 应用实例
 app = FastAPI()
@@ -76,29 +113,29 @@ class LLMConfig(BaseModel):
 
 # 使用 Pydantic 定义前端发送过来的请求体(body)应该长什么样
 # 这可以提供自动的数据验证和生成 API 文档
+# Note: user_id is no longer in the body — it comes from JWT (verify_jwt dependency)
 class SimulationRequest(BaseModel):
     prompt: str
-    user_id: str # 我们需要前端告诉我们这是哪个用户的请求
     llm_config: Optional[LLMConfig] = None  # 用户可选的 LLM 配置
 
 class FeedbackRequest(BaseModel):
     file_path: str  # 文件路径，如 "output/log.blockMesh"
     feedback_content: str  # 反馈内容
-    user_id: str  # 用户ID，用于权限验证
 
 # --- 3. 创建 API 端点 (Endpoint) ---
 
 @app.post("/api/v1/simulations")
-async def create_simulation_task(request: SimulationRequest):
+async def create_simulation_task(request: SimulationRequest, user_id: str = Depends(verify_jwt)):
     """
     接收一个新的仿真请求，并将其作为任务插入数据库，状态为 'queued'
+    Requires a valid Supabase JWT in the Authorization header.
     """
-    logger.info(f"Received new simulation request for user: {request.user_id}")
+    logger.info(f"Received new simulation request for user: {user_id}")
     try:
         # 构建插入数据
         insert_data = {
             'prompt': request.prompt,
-            'user_id': request.user_id,
+            'user_id': user_id,
             'status': 'queued'  # 将初始状态明确设置为 '排队中'
         }
         # 如果用户提供了 LLM 配置，写入 llm_config JSONB 列
@@ -111,7 +148,7 @@ async def create_simulation_task(request: SimulationRequest):
         # 检查 Supabase 的响应，看是否有数据被返回
         if response.data:
             new_task = response.data[0]
-            logger.info(f"Successfully queued task {new_task['id']} for user {request.user_id}")
+            logger.info(f"Successfully queued task {new_task['id']} for user {user_id}")
             # 将新创建的任务记录返回给前端，这是一个好的实践
             return {"status": "success", "message": "Simulation task queued successfully.", "task": new_task}
         else:
@@ -189,9 +226,10 @@ async def get_file_tree(job_id: int):
 # --- 修改 api_server.py 中的 submit_feedback 函数 ---
 
 @app.post("/api/v1/simulations/{job_id}/feedback")
-async def submit_feedback(job_id: int, request: FeedbackRequest):
+async def submit_feedback(job_id: int, request: FeedbackRequest, user_id: str = Depends(verify_jwt)):
     """
     提交文件反馈。
+    Requires a valid Supabase JWT in the Authorization header.
     1. [新增] 保存到本地 WSL 文件系统 (Foam-Agent/runs/{job_id}/...)
     2. 上传到 Supabase Storage (云端备份)
     """
@@ -203,8 +241,8 @@ async def submit_feedback(job_id: int, request: FeedbackRequest):
 
         job = response.data[0]
 
-        # 2. 验证权限
-        if job['user_id'] != request.user_id:
+        # 2. 验证权限 (user_id from JWT, not from request body)
+        if job['user_id'] != user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
         # 3. 验证大小 (限制 5KB)
@@ -238,7 +276,7 @@ async def submit_feedback(job_id: int, request: FeedbackRequest):
         # ==========================================
 
         # 5. 上传到 Supabase Storage (保持原有逻辑)
-        storage_base_path = f"public/{request.user_id}/{job_id}"
+        storage_base_path = f"public/{user_id}/{job_id}"
         storage_feedback_path = f"{storage_base_path}/{feedback_file_path}"
 
         try:
