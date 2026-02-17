@@ -1,5 +1,7 @@
 # cfdqanda-server
 
+> **License:** [PolyForm Strict 1.0.0](https://polyformproject.org/licenses/strict/1.0.0/) — source available for personal and non-commercial use only. Commercial use is prohibited.
+
 Platform server layer for [CFDQandA](https://cfdqanda.com) — a natural-language-driven CFD simulation platform.
 
 This repository contains the **API server** (FastAPI) and **background worker** that bridge the React frontend with the [Foam-Agent](https://github.com/YYgroup/Foam-Agent) simulation engine.
