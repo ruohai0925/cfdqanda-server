@@ -274,23 +274,22 @@ def find_and_process_job():
     """
     查找一个'queued'状态的任务并处理它。
     如果没有任务，则返回 False。如果处理了任务，则返回 True。
+
+    Uses the claim_next_job() PostgreSQL RPC function which atomically
+    selects and locks the next queued job using FOR UPDATE SKIP LOCKED,
+    preventing multiple Workers from claiming the same job.
     """
-    # 查找并锁定一个任务
-    response = supabase.table('simulations').select('*').eq('status', 'queued').limit(1).execute()
+    # Atomically claim the next queued job via RPC.
+    # The claim_next_job() function uses FOR UPDATE SKIP LOCKED to ensure
+    # only one Worker can claim each job, even under concurrent access.
+    response = supabase.rpc('claim_next_job').execute()
 
     if not response.data:
         return False
 
     job = response.data[0]
     job_id = job['id']
-    logger.info(f"Found new job. ID: {job_id}. Processing...")
-
-    # 更新状态为 'running'
-    try:
-        supabase.table('simulations').update({'status': 'running'}).eq('id', job_id).execute()
-    except Exception as e:
-        logger.error(f"Failed to update job {job_id} status to 'running': {e}")
-        return True
+    logger.info(f"Claimed job {job_id} via claim_next_job() RPC. Processing...")
 
     # --- 读取用户 LLM 配置，构建子进程环境变量 ---
     llm_config = job.get('llm_config') or {}
