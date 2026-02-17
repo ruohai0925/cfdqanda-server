@@ -29,6 +29,10 @@ if not os.path.isdir(FOAM_AGENT_DIR):
     raise RuntimeError(f"FOAM_AGENT_DIR={FOAM_AGENT_DIR} does not exist.")
 logger.info(f"FOAM_AGENT_DIR resolved to: {FOAM_AGENT_DIR}")
 
+# Simulation subprocess timeout (seconds). Default: 3600 (1 hour).
+SIMULATION_TIMEOUT = int(os.environ.get("SIMULATION_TIMEOUT", "3600"))
+logger.info(f"Simulation timeout set to {SIMULATION_TIMEOUT} seconds")
+
 # 从环境变量加载 Supabase 配置
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -331,7 +335,8 @@ def find_and_process_job():
                 stdout=log_file,  # 将标准输出写入日志文件
                 stderr=log_file,  # 将标准错误也写入同一个日志文件
                 text=True,
-                check=False
+                check=False,
+                timeout=SIMULATION_TIMEOUT
             )
 
         # 4. 根据结果更新数据库
@@ -405,6 +410,17 @@ def find_and_process_job():
                 'status': 'failed',
                 'result_data': error_details
             }).eq('id', job_id).execute()
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Job {job_id} timed out after {SIMULATION_TIMEOUT} seconds.")
+        supabase.table('simulations').update({
+            'status': 'failed',
+            'result_data': {
+                'error': f"Simulation timed out after {SIMULATION_TIMEOUT} seconds.",
+                'log_path_on_server': log_path,
+                'timeout_seconds': SIMULATION_TIMEOUT
+            }
+        }).eq('id', job_id).execute()
 
     except Exception as e:
         logger.error(f"A critical error occurred while processing job {job_id}: {e}", exc_info=True)
