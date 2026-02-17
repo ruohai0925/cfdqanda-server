@@ -7,6 +7,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from supabase import create_client, Client
+from allrun_validator import audit_allrun_scripts
 
 # --- 1. 初始化与配置 ---
 
@@ -389,7 +390,28 @@ def find_and_process_job():
                 timeout=SIMULATION_TIMEOUT
             )
 
-        # 4. 根据结果更新数据库
+        # 4. Post-execution Allrun security audit
+        allrun_audit = audit_allrun_scripts(run_dir)
+        if not allrun_audit['is_safe']:
+            logger.critical(
+                f"SECURITY ALERT: Job {job_id} Allrun contains dangerous commands: "
+                f"{allrun_audit['dangerous_summary']}"
+            )
+        elif allrun_audit['files_scanned'] > 0:
+            unknown_count = sum(
+                len(r['unknown_commands']) for r in allrun_audit['results']
+            )
+            if unknown_count > 0:
+                logger.warning(
+                    f"Job {job_id}: Allrun audit found {unknown_count} unknown command(s)"
+                )
+            else:
+                logger.info(
+                    f"Job {job_id}: Allrun audit passed "
+                    f"({allrun_audit['files_scanned']} file(s) scanned)"
+                )
+
+        # 5. 根据结果更新数据库
         if result.returncode == 0:
             # 命令成功
             logger.info(f"Job {job_id} completed successfully.")
@@ -438,7 +460,8 @@ def find_and_process_job():
                 "upload_stats": {  # 上传统计信息
                     "uploaded": uploaded_count,
                     "failed": failed_count
-                }
+                },
+                "allrun_audit": allrun_audit,  # Allrun security audit results
             }
 
             # 步骤5: 更新数据库
@@ -454,7 +477,8 @@ def find_and_process_job():
             logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
             error_details = {
                 "error": f"Foam-Agent script failed with return code {result.returncode}.",
-                "log_path_on_server": log_path
+                "log_path_on_server": log_path,
+                "allrun_audit": allrun_audit,
             }
             supabase.table('simulations').update({
                 'status': 'failed',
