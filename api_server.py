@@ -107,8 +107,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,       # 允许 "白名单" 中的来源
     allow_credentials=True,    # 允许携带 cookie
-    allow_methods=["*"],         # 允许所有 HTTP 方法 (GET, POST, etc.)
-    allow_headers=["*"],         # 允许所有 HTTP 请求头
+    allow_methods=["GET", "POST", "OPTIONS"],  # Only methods our API uses
+    allow_headers=["Content-Type", "Authorization"],  # JSON body + JWT Bearer token
 )
 # ----------------------------------
 
