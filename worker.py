@@ -274,7 +274,7 @@ def recover_stale_jobs():
 # Throttle: run at most once per hour
 _last_purge_time = 0.0
 PURGE_INTERVAL = 3600       # seconds between purge runs
-PURGE_RETENTION_DAYS = 7    # keep soft-deleted rows for 7 days
+PURGE_RETENTION_DAYS = 3    # keep soft-deleted rows for 3 days
 
 
 def purge_deleted_simulations():
