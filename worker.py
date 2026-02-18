@@ -296,13 +296,6 @@ def find_and_process_job():
     llm_config = job.get('llm_config') or {}
     child_env = os.environ.copy()
 
-    if llm_config.get('model_provider'):
-        child_env['FOAM_MODEL_PROVIDER'] = llm_config['model_provider']
-        logger.info(f"Job {job_id}: overriding model_provider={llm_config['model_provider']}")
-    if llm_config.get('model_version'):
-        child_env['FOAM_MODEL_VERSION'] = llm_config['model_version']
-        logger.info(f"Job {job_id}: overriding model_version={llm_config['model_version']}")
-
     # 注入用户自带的 API key（按 provider 设置对应的环境变量）
     user_api_key = llm_config.get('api_key')
     if user_api_key:
@@ -338,40 +331,36 @@ def find_and_process_job():
     log_path = os.path.join(run_dir, "simulation.log")
 
     try:
-        # 根据是否有用户 LLM 配置，选择不同的启动方式
-        has_llm_override = llm_config.get('model_provider') or llm_config.get('model_version')
+        # Always use python -c inline startup to patch Config defaults before import.
+        # This is necessary because Foam-Agent's services/__init__.py creates
+        # global_llm_service = LLMService(Config()) at import time, and the default
+        # model_provider may be 'openai-codex' which requires Codex OAuth.
+        # We always override to 'openai' (using OPENAI_API_KEY) unless the user
+        # provides a different provider.
+        effective_provider = llm_config.get('model_provider') or 'openai'
+        effective_version = llm_config.get('model_version') or 'gpt-4o'
+        child_env['FOAM_MODEL_PROVIDER'] = effective_provider
+        child_env['FOAM_MODEL_VERSION'] = effective_version
+        child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
+        child_env['FOAM_PROMPT_PATH'] = os.path.abspath(prompt_path)
+        logger.info(f"Job {job_id}: using provider={effective_provider}, model={effective_version}")
 
-        if has_llm_override:
-            # 用户提供了 LLM 配置 → 用 python -c 内联启动，
-            # 在 import 之前 patch Config.__init__.__defaults__，
-            # 绕过 services/__init__.py 的 import-time LLMService(Config()) 初始化
-            child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
-            child_env['FOAM_PROMPT_PATH'] = os.path.abspath(prompt_path)
-            command = [
-                "python", "-c",
-                "import os,sys,inspect; sys.path.insert(0,'src'); "
-                "from config import Config; "
-                "params=list(inspect.signature(Config.__init__).parameters.keys()); "
-                "params.remove('self'); "
-                "defaults=list(Config.__init__.__defaults__); "
-                "p=os.environ.get('FOAM_MODEL_PROVIDER'); "
-                "v=os.environ.get('FOAM_MODEL_VERSION'); "
-                "p and defaults.__setitem__(params.index('model_provider'),p); "
-                "v and defaults.__setitem__(params.index('model_version'),v); "
-                "Config.__init__.__defaults__=tuple(defaults); "
-                "from main import main; "
-                "c=Config(); c.case_dir=os.environ['FOAM_OUTPUT_DIR']; "
-                "main(open(os.environ['FOAM_PROMPT_PATH']).read(),c)"
-            ]
-        else:
-            # 无用户配置 → 走原来的 foambench_main.py 流程
-            openfoam_path = os.environ.get("WM_PROJECT_DIR", "/opt/openfoam10")
-            command = [
-                "python", os.path.join(FOAM_AGENT_DIR, "foambench_main.py"),
-                "--openfoam_path", openfoam_path,
-                "--output", output_path,
-                "--prompt_path", prompt_path
-            ]
+        command = [
+            "python", "-c",
+            "import os,sys,inspect; sys.path.insert(0,'src'); "
+            "from config import Config; "
+            "params=list(inspect.signature(Config.__init__).parameters.keys()); "
+            "params.remove('self'); "
+            "defaults=list(Config.__init__.__defaults__); "
+            "p=os.environ.get('FOAM_MODEL_PROVIDER'); "
+            "v=os.environ.get('FOAM_MODEL_VERSION'); "
+            "p and defaults.__setitem__(params.index('model_provider'),p); "
+            "v and defaults.__setitem__(params.index('model_version'),v); "
+            "Config.__init__.__defaults__=tuple(defaults); "
+            "from main import main; "
+            "c=Config(); c.case_dir=os.environ['FOAM_OUTPUT_DIR']; "
+            "main(open(os.environ['FOAM_PROMPT_PATH']).read(),c)"
+        ]
 
         logger.info(f"Executing command for job {job_id}: {' '.join(command)}")
         logger.info(f"Log file for this run will be at: {log_path}")

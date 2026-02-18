@@ -88,6 +88,15 @@ nohup uvicorn api_server:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
 nohup python -u worker.py > worker.log 2>&1 &
 ```
 
+### Stopping services
+
+```bash
+# Use pkill -f (matches full command line) instead of kill $PID.
+# nohup returns the bash wrapper PID, not the actual Python process.
+pkill -f "python.*worker\.py"
+pkill -f "uvicorn api_server:app"
+```
+
 ## API Endpoints
 
 | Method | Path | Description |

@@ -88,6 +88,15 @@ nohup uvicorn api_server:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
 nohup python -u worker.py > worker.log 2>&1 &
 ```
 
+### 停止服务
+
+```bash
+# 使用 pkill -f（匹配完整命令行），不要用 kill $PID。
+# nohup 返回的是 bash 包装进程的 PID，不是实际的 Python 进程。
+pkill -f "python.*worker\.py"
+pkill -f "uvicorn api_server:app"
+```
+
 ## API 接口
 
 | 方法 | 路径 | 说明 |
