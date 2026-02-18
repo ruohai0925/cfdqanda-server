@@ -4,7 +4,7 @@ Step 006: CORS restriction tests.
 Verifies that:
 1. Allowed origins receive proper CORS headers for GET/POST.
 2. Preflight (OPTIONS) for allowed methods (GET, POST) succeeds.
-3. Preflight for disallowed methods (PUT, DELETE, PATCH) is rejected.
+3. Preflight for disallowed methods (PUT, PATCH) is rejected; DELETE is allowed.
 4. Disallowed origins are rejected.
 5. Only Content-Type and Authorization headers are allowed.
 """
@@ -93,8 +93,8 @@ class TestPreflightDisallowedMethods:
         )
         assert resp.status_code == 400
 
-    def test_preflight_delete_rejected(self, app_client):
-        """OPTIONS preflight for DELETE → 400 (method not allowed by CORS)."""
+    def test_preflight_delete_allowed(self, app_client):
+        """OPTIONS preflight for DELETE → 200 (DELETE is an allowed CORS method)."""
         resp = app_client.options(
             "/api/v1/simulations/123",
             headers={
@@ -102,7 +102,8 @@ class TestPreflightDisallowedMethods:
                 "Access-Control-Request-Method": "DELETE",
             },
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+        assert "DELETE" in resp.headers.get("access-control-allow-methods", "")
 
     def test_preflight_patch_rejected(self, app_client):
         """OPTIONS preflight for PATCH → 400 (method not allowed by CORS)."""

@@ -9,6 +9,7 @@ load_dotenv()  # 自动读取同目录下的 .env 文件
 from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime, timezone
 import logging
 import jwt
 from fastapi.middleware.cors import CORSMiddleware
@@ -107,7 +108,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,       # 允许 "白名单" 中的来源
     allow_credentials=True,    # 允许携带 cookie
-    allow_methods=["GET", "POST", "OPTIONS"],  # Only methods our API uses
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],  # Only methods our API uses
     allow_headers=["Content-Type", "Authorization"],  # JSON body + JWT Bearer token
 )
 # ----------------------------------
@@ -319,4 +320,67 @@ async def submit_feedback(request: Request, job_id: int, fb_request: FeedbackReq
         raise
     except Exception as e:
         logger.error(f"Error in submit_feedback: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 6. Soft-delete and restore endpoints ---
+
+@app.delete("/api/v1/simulations/{job_id}")
+async def soft_delete_simulation(job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    Soft-delete a simulation by setting deleted_at timestamp.
+    Cannot delete a running job. Requires ownership.
+    """
+    try:
+        response = supabase.table('simulations').select('id, user_id, status').eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if job['status'] == 'running':
+            raise HTTPException(status_code=409, detail="Cannot delete a running simulation")
+
+        supabase.table('simulations').update(
+            {'deleted_at': datetime.now(timezone.utc).isoformat()}
+        ).eq('id', job_id).execute()
+
+        logger.info(f"Soft-deleted simulation {job_id} by user {user_id}")
+        return {"status": "success", "message": f"Simulation {job_id} deleted"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in soft_delete_simulation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/simulations/{job_id}/restore")
+async def restore_simulation(job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    Restore a soft-deleted simulation by clearing deleted_at.
+    """
+    try:
+        response = supabase.table('simulations').select('id, user_id, deleted_at').eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if not job.get('deleted_at'):
+            raise HTTPException(status_code=400, detail="Simulation is not deleted")
+
+        supabase.table('simulations').update(
+            {'deleted_at': None}
+        ).eq('id', job_id).execute()
+
+        logger.info(f"Restored simulation {job_id} by user {user_id}")
+        return {"status": "success", "message": f"Simulation {job_id} restored"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in restore_simulation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

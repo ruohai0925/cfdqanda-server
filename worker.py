@@ -269,7 +269,81 @@ def recover_stale_jobs():
         logger.error(f"Error during stale job recovery: {e}", exc_info=True)
 
 
-# --- 4. 核心工作逻辑 ---
+# --- 4. Purge soft-deleted simulations ---
+
+# Throttle: run at most once per hour
+_last_purge_time = 0.0
+PURGE_INTERVAL = 3600       # seconds between purge runs
+PURGE_RETENTION_DAYS = 7    # keep soft-deleted rows for 7 days
+
+
+def purge_deleted_simulations():
+    """
+    Hard-delete simulations where deleted_at is older than PURGE_RETENTION_DAYS.
+    Cleanup order: Supabase Storage files -> local runs/ directory -> DB row.
+    Throttled to run at most once per PURGE_INTERVAL seconds.
+    """
+    global _last_purge_time
+    now = time.time()
+    if now - _last_purge_time < PURGE_INTERVAL:
+        return
+    _last_purge_time = now
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=PURGE_RETENTION_DAYS)).isoformat()
+    try:
+        response = (
+            supabase.table('simulations')
+            .select('id, user_id, result_data')
+            .not_.is_('deleted_at', 'null')
+            .lt('deleted_at', cutoff)
+            .execute()
+        )
+        rows = response.data
+        if not rows:
+            logger.info("Purge: no expired soft-deleted simulations.")
+            return
+
+        logger.info(f"Purge: found {len(rows)} simulation(s) to hard-delete.")
+
+        for row in rows:
+            job_id = row['id']
+            user_id = row.get('user_id')
+            result_data = row.get('result_data') or {}
+
+            # 1. Delete files from Supabase Storage
+            storage_base = result_data.get('storage_base_path')
+            if storage_base:
+                try:
+                    # List all files under the storage path and remove them
+                    listed = supabase.storage.from_('simulation_results').list(storage_base)
+                    if listed:
+                        paths = [f"{storage_base}/{f['name']}" for f in listed]
+                        supabase.storage.from_('simulation_results').remove(paths)
+                    logger.info(f"Purge: removed Storage files for job {job_id}")
+                except Exception as e:
+                    logger.warning(f"Purge: failed to remove Storage files for job {job_id}: {e}")
+
+            # 2. Delete local runs/ directory
+            local_run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
+            if os.path.isdir(local_run_dir):
+                try:
+                    shutil.rmtree(local_run_dir)
+                    logger.info(f"Purge: removed local dir {local_run_dir}")
+                except Exception as e:
+                    logger.warning(f"Purge: failed to remove local dir {local_run_dir}: {e}")
+
+            # 3. Delete DB row
+            try:
+                supabase.table('simulations').delete().eq('id', job_id).execute()
+                logger.info(f"Purge: hard-deleted simulation {job_id} from DB")
+            except Exception as e:
+                logger.error(f"Purge: failed to delete DB row for job {job_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Purge: error during purge cycle: {e}", exc_info=True)
+
+
+# --- 5. 核心工作逻辑 ---
 
 def find_and_process_job():
     """
@@ -507,6 +581,9 @@ def main_loop():
     logger.info("Worker started. Looking for jobs...")
     while True:
         try:
+            # Purge expired soft-deleted simulations (throttled internally)
+            purge_deleted_simulations()
+
             processed_a_job = find_and_process_job()
             if not processed_a_job:
                 # 如果没有任务，就休息一下
