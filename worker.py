@@ -407,12 +407,11 @@ def find_and_process_job():
     try:
         # Always use python -c inline startup to patch Config defaults before import.
         # This is necessary because Foam-Agent's services/__init__.py creates
-        # global_llm_service = LLMService(Config()) at import time, and the default
-        # model_provider may be 'openai-codex' which requires Codex OAuth.
-        # We always override to 'openai' (using OPENAI_API_KEY) unless the user
-        # provides a different provider.
-        effective_provider = llm_config.get('model_provider') or 'openai'
-        effective_version = llm_config.get('model_version') or 'gpt-4o'
+        # global_llm_service = LLMService(Config()) at import time.
+        # Default: 'openai-codex'/'gpt-5.3-codex' (ChatGPT OAuth, free for subscribers).
+        # OPENAI_API_KEY from .env is still needed for the embedding provider.
+        effective_provider = llm_config.get('model_provider') or 'openai-codex'
+        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
         child_env['FOAM_MODEL_PROVIDER'] = effective_provider
         child_env['FOAM_MODEL_VERSION'] = effective_version
         child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
