@@ -108,7 +108,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,       # 允许 "白名单" 中的来源
     allow_credentials=True,    # 允许携带 cookie
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],  # Only methods our API uses
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],  # Only methods our API uses
     allow_headers=["Content-Type", "Authorization"],  # JSON body + JWT Bearer token
 )
 # ----------------------------------
@@ -131,6 +131,10 @@ class SimulationRequest(BaseModel):
 class FeedbackRequest(BaseModel):
     file_path: str  # 文件路径，如 "output/log.blockMesh"
     feedback_content: str  # 反馈内容
+
+class RatingRequest(BaseModel):
+    rating: int  # 1=success, 2=partial success, 3=failed
+    comment: Optional[str] = None
 
 # --- 3. 创建 API 端点 (Endpoint) ---
 
@@ -323,7 +327,47 @@ async def submit_feedback(request: Request, job_id: int, fb_request: FeedbackReq
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- 6. Soft-delete and restore endpoints ---
+# --- 6. Task-level rating endpoint ---
+
+@app.patch("/api/v1/simulations/{job_id}/rating")
+@limiter.limit("10/minute")
+async def submit_rating(request: Request, job_id: str, rating_request: RatingRequest, user_id: str = Depends(verify_jwt)):
+    """
+    Submit a task-level rating (1=success, 2=partial, 3=failed) with optional comment.
+    Requires a valid Supabase JWT. Only the task owner can rate.
+    """
+    if rating_request.rating not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Rating must be 1 (success), 2 (partial), or 3 (failed)")
+
+    if rating_request.comment and len(rating_request.comment) > 500:
+        raise HTTPException(status_code=400, detail="Comment must be 500 characters or less")
+
+    try:
+        response = supabase.table('simulations').select('id, user_id').eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+
+        update_data = {'user_rating': rating_request.rating}
+        if rating_request.comment is not None:
+            update_data['user_comment'] = rating_request.comment
+
+        supabase.table('simulations').update(update_data).eq('id', job_id).execute()
+
+        logger.info(f"Rating {rating_request.rating} submitted for job {job_id} by user {user_id}")
+        return {"status": "success", "message": "Rating submitted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in submit_rating: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 7. Soft-delete and restore endpoints ---
 
 @app.delete("/api/v1/simulations/{job_id}")
 async def soft_delete_simulation(job_id: str, user_id: str = Depends(verify_jwt)):
