@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import subprocess
+import signal
 import json
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,10 @@ logger.info(f"Simulation timeout set to {SIMULATION_TIMEOUT} seconds")
 # Jobs stuck in 'running' longer than this are reset to 'queued' on Worker startup.
 STALE_JOB_THRESHOLD = int(os.environ.get("STALE_JOB_THRESHOLD", "7200"))
 logger.info(f"Stale job threshold set to {STALE_JOB_THRESHOLD} seconds")
+
+# How often (seconds) to check DB for cancellation while subprocess is running.
+CANCEL_CHECK_INTERVAL = int(os.environ.get("CANCEL_CHECK_INTERVAL", "5"))
+logger.info(f"Cancel check interval set to {CANCEL_CHECK_INTERVAL} seconds")
 
 # 从环境变量加载 Supabase 配置
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -343,7 +348,40 @@ def purge_deleted_simulations():
         logger.error(f"Purge: error during purge cycle: {e}", exc_info=True)
 
 
-# --- 5. 核心工作逻辑 ---
+# --- 5. Cancellation helpers ---
+
+def check_job_cancelled(job_id):
+    """Check if a job has been cancelled by the user (status == 'cancelled' in DB)."""
+    try:
+        response = supabase.table('simulations').select('status').eq('id', job_id).execute()
+        if response.data and response.data[0]['status'] == 'cancelled':
+            return True
+    except Exception as e:
+        logger.warning(f"Job {job_id}: failed to check cancel status: {e}")
+    return False
+
+
+def _kill_process_tree(process):
+    """
+    Kill a subprocess and all its children by sending signals to the process group.
+    Uses SIGTERM first (graceful), then SIGKILL (force) if still alive after 10s.
+    Requires the process to have been started with start_new_session=True.
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return  # Already dead
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(pgid, signal.SIGKILL)
+        process.wait()
+    except ProcessLookupError:
+        pass  # Already dead
+
+
+# --- 6. 核心工作逻辑 ---
 
 def find_and_process_job():
     """
@@ -438,19 +476,66 @@ def find_and_process_job():
         logger.info(f"Executing command for job {job_id}: {' '.join(command)}")
         logger.info(f"Log file for this run will be at: {log_path}")
 
-        # 2. 打开日志文件，准备写入
+        # 2. Run subprocess with Popen + polling loop (supports cancel + timeout)
         with open(log_path, 'w') as log_file:
-            # 3. 运行子进程，使用包含用户 LLM 配置的环境变量
-            result = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                cwd=FOAM_AGENT_DIR,  # 子进程在 Foam-Agent 目录下运行
-                env=child_env,    # 注入用户配置的环境变量
-                stdout=log_file,  # 将标准输出写入日志文件
-                stderr=log_file,  # 将标准错误也写入同一个日志文件
+                cwd=FOAM_AGENT_DIR,
+                env=child_env,
+                stdout=log_file,
+                stderr=log_file,
                 text=True,
-                check=False,
-                timeout=SIMULATION_TIMEOUT
+                start_new_session=True,  # New process group for clean kill
             )
+
+            # Poll loop: check process completion, timeout, and cancellation
+            start_time = time.time()
+            cancelled = False
+            timed_out = False
+
+            while True:
+                retcode = process.poll()
+                if retcode is not None:
+                    break  # Process finished naturally
+
+                elapsed = time.time() - start_time
+                if elapsed >= SIMULATION_TIMEOUT:
+                    timed_out = True
+                    logger.error(f"Job {job_id} timed out after {SIMULATION_TIMEOUT} seconds.")
+                    _kill_process_tree(process)
+                    break
+
+                if check_job_cancelled(job_id):
+                    cancelled = True
+                    logger.info(f"Job {job_id}: cancellation detected, terminating subprocess...")
+                    _kill_process_tree(process)
+                    break
+
+                time.sleep(CANCEL_CHECK_INTERVAL)
+
+        # 3. Handle the three outcomes: cancelled, timed_out, or normal completion
+
+        if cancelled:
+            logger.info(f"Job {job_id} was cancelled by user. Subprocess terminated.")
+            supabase.table('simulations').update({
+                'status': 'cancelled',
+                'result_data': {
+                    'error': 'Simulation cancelled by user.',
+                    'log_path_on_server': log_path,
+                }
+            }).eq('id', job_id).execute()
+            return True
+
+        if timed_out:
+            supabase.table('simulations').update({
+                'status': 'failed',
+                'result_data': {
+                    'error': f"Simulation timed out after {SIMULATION_TIMEOUT} seconds.",
+                    'log_path_on_server': log_path,
+                    'timeout_seconds': SIMULATION_TIMEOUT,
+                }
+            }).eq('id', job_id).execute()
+            return True
 
         # 4. Post-execution Allrun security audit
         allrun_audit = audit_allrun_scripts(run_dir)
@@ -473,19 +558,16 @@ def find_and_process_job():
                     f"({allrun_audit['files_scanned']} file(s) scanned)"
                 )
 
-        # 5. 根据结果更新数据库
-        if result.returncode == 0:
-            # 命令成功
+        # 5. Handle normal completion based on return code
+        returncode = process.returncode
+        if returncode == 0:
             logger.info(f"Job {job_id} completed successfully.")
 
-            # Storage中的基础路径
             storage_base_path = f"public/{job['user_id']}/{job_id}"
 
-            # 步骤1: 构建文件树结构（用于前端快速显示）
             logger.info(f"Building file tree for run directory: {run_dir}")
             file_tree = build_file_tree(run_dir)
 
-            # 步骤2: 上传ZIP文件（保留原有功能，作为完整备份）
             logger.info(f"Uploading ZIP file for job {job_id}...")
             zip_path_base = os.path.join(run_dir, "result")
             shutil.make_archive(zip_path_base, 'zip', output_path)
@@ -500,8 +582,6 @@ def find_and_process_job():
             except Exception as e:
                 logger.error(f"Failed to upload ZIP file: {e}")
 
-            # 步骤3: 上传整个run_dir目录下的所有文件到Storage
-            # 这样前端可以通过Supabase Storage API直接访问文件
             logger.info(f"Uploading all files from {run_dir} to Storage...")
             uploaded_count, failed_count = upload_directory_to_storage(
                 run_dir,
@@ -512,21 +592,19 @@ def find_and_process_job():
             if failed_count > 0:
                 logger.warning(f"Some files failed to upload: {failed_count} files failed")
 
-            # 步骤4: 构建最终结果数据
             final_result = {
                 "log_path_on_server": log_path,
                 "output_path_on_server": output_path,
-                "zip_storage_path": zip_storage_path,  # ZIP文件路径（保留）
-                "storage_base_path": storage_base_path,  # Storage基础路径（用于前端访问）
-                "file_tree": file_tree,  # 文件树结构（便于前端快速显示）
-                "upload_stats": {  # 上传统计信息
+                "zip_storage_path": zip_storage_path,
+                "storage_base_path": storage_base_path,
+                "file_tree": file_tree,
+                "upload_stats": {
                     "uploaded": uploaded_count,
                     "failed": failed_count
                 },
-                "allrun_audit": allrun_audit,  # Allrun security audit results
+                "allrun_audit": allrun_audit,
             }
 
-            # 步骤5: 更新数据库
             supabase.table('simulations').update({
                 'status': 'completed',
                 'result_data': final_result
@@ -535,10 +613,9 @@ def find_and_process_job():
             logger.info(f"Job {job_id} completed and all files uploaded successfully. "
                        f"Total files: {uploaded_count}, Failed: {failed_count}")
         else:
-            # 命令失败
             logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
             error_details = {
-                "error": f"Foam-Agent script failed with return code {result.returncode}.",
+                "error": f"Foam-Agent script failed with return code {returncode}.",
                 "log_path_on_server": log_path,
                 "allrun_audit": allrun_audit,
             }
@@ -546,17 +623,6 @@ def find_and_process_job():
                 'status': 'failed',
                 'result_data': error_details
             }).eq('id', job_id).execute()
-
-    except subprocess.TimeoutExpired:
-        logger.error(f"Job {job_id} timed out after {SIMULATION_TIMEOUT} seconds.")
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': f"Simulation timed out after {SIMULATION_TIMEOUT} seconds.",
-                'log_path_on_server': log_path,
-                'timeout_seconds': SIMULATION_TIMEOUT
-            }
-        }).eq('id', job_id).execute()
 
     except Exception as e:
         logger.error(f"A critical error occurred while processing job {job_id}: {e}", exc_info=True)
@@ -568,7 +634,7 @@ def find_and_process_job():
     return True
 
 
-# --- 5. 主循环 ---
+# --- 7. 主循环 ---
 
 def main_loop():
     """
@@ -592,6 +658,6 @@ def main_loop():
             time.sleep(30) # 如果主循环出错，等待更长时间再重试
 
 
-# --- 6. 脚本入口 ---
+# --- 8. 脚本入口 ---
 if __name__ == "__main__":
     main_loop()

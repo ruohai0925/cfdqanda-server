@@ -400,6 +400,41 @@ async def soft_delete_simulation(job_id: str, user_id: str = Depends(verify_jwt)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/v1/simulations/{job_id}/cancel")
+@limiter.limit("10/minute")
+async def cancel_simulation(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    Cancel a queued or running simulation.
+    Sets status to 'cancelled'. Worker will detect this and kill the subprocess.
+    """
+    try:
+        response = supabase.table('simulations').select('id, user_id, status').eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if job['status'] not in ('queued', 'running'):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot cancel a simulation with status '{job['status']}'. Only queued or running simulations can be cancelled."
+            )
+
+        supabase.table('simulations').update(
+            {'status': 'cancelled'}
+        ).eq('id', job_id).execute()
+
+        logger.info(f"Simulation {job_id} cancelled by user {user_id}")
+        return {"status": "success", "message": f"Simulation {job_id} cancelled"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in cancel_simulation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/v1/simulations/{job_id}/restore")
 async def restore_simulation(job_id: str, user_id: str = Depends(verify_jwt)):
     """
