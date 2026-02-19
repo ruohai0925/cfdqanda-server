@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from supabase import create_client, Client
 from allrun_validator import audit_allrun_scripts
+from token_extractor import extract_token_usage
 
 # --- 1. 初始化与配置 ---
 
@@ -592,6 +593,9 @@ def find_and_process_job():
             if failed_count > 0:
                 logger.warning(f"Some files failed to upload: {failed_count} files failed")
 
+            # 6. Extract token usage from simulation log
+            token_usage = extract_token_usage(log_path)
+
             final_result = {
                 "log_path_on_server": log_path,
                 "output_path_on_server": output_path,
@@ -604,6 +608,8 @@ def find_and_process_job():
                 },
                 "allrun_audit": allrun_audit,
             }
+            if token_usage:
+                final_result["token_usage"] = token_usage
 
             supabase.table('simulations').update({
                 'status': 'completed',
