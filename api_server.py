@@ -8,7 +8,7 @@ load_dotenv()  # 自动读取同目录下的 .env 文件
 # ------------------
 from supabase import create_client, Client
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timezone
 import logging
 import jwt
@@ -127,6 +127,9 @@ class LLMConfig(BaseModel):
 class SimulationRequest(BaseModel):
     prompt: str
     llm_config: Optional[LLMConfig] = None  # 用户可选的 LLM 配置
+    pre_run_end_time: Optional[int] = None  # Pre-run timesteps: None=default(10), -1=disabled, positive=custom
+    pipeline_mode: str = 'auto'  # 'auto' (subprocess one-shot) or 'controlled' (MCP stage-by-stage)
+    checkpoints: Optional[List[str]] = None  # Active checkpoints: ['files_review', 'pre_run_review', 'plan_review']
 
 class FeedbackRequest(BaseModel):
     file_path: str  # 文件路径，如 "output/log.blockMesh"
@@ -156,6 +159,16 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
         # 如果用户提供了 LLM 配置，写入 llm_config JSONB 列
         if sim_request.llm_config:
             insert_data['llm_config'] = sim_request.llm_config.model_dump(exclude_none=True)
+        # Pre-run end time for checkpoint mechanism
+        if sim_request.pre_run_end_time is not None:
+            insert_data['pre_run_end_time'] = sim_request.pre_run_end_time
+        # Pipeline mode: 'auto' (default) or 'controlled' (MCP stage-by-stage)
+        if sim_request.pipeline_mode != 'auto':
+            insert_data['pipeline_mode'] = sim_request.pipeline_mode
+            if sim_request.checkpoints:
+                insert_data['pipeline_state'] = {
+                    'active_checkpoints': sim_request.checkpoints
+                }
 
         # 将新任务插入到 'simulations' 表中
         response = supabase.table('simulations').insert(insert_data).execute()
@@ -205,11 +218,11 @@ async def get_file_tree(job_id: int):
 
         job = response.data[0]
 
-        # 检查任务是否完成
-        if job['status'] not in ['completed', 'failed']:
+        # Check if task has files to browse (completed, failed, or checkpoint)
+        if job['status'] not in ['completed', 'failed', 'checkpoint']:
             raise HTTPException(
                 status_code=400,
-                detail=f"Simulation {job_id} is not completed yet. Current status: {job['status']}"
+                detail=f"Simulation {job_id} has no files yet. Current status: {job['status']}"
             )
 
         # 从result_data中获取文件树
@@ -434,6 +447,187 @@ async def cancel_simulation(request: Request, job_id: str, user_id: str = Depend
         logger.error(f"Error in cancel_simulation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- 8. Checkpoint endpoints ---
+
+@app.post("/api/v1/simulations/{job_id}/checkpoint/confirm")
+@limiter.limit("10/minute")
+async def confirm_checkpoint(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    User confirms pre-run results, proceed to normal-run.
+    Sets checkpoint_phase to 'normal-run' and status back to 'queued'
+    so the Worker picks it up and runs the full simulation.
+    """
+    try:
+        response = supabase.table('simulations').select('id, user_id, status, result_data').eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if job['status'] != 'checkpoint':
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot confirm: simulation status is '{job['status']}', expected 'checkpoint'."
+            )
+
+        # Update checkpoint_phase and re-queue
+        existing_result = job.get('result_data') or {}
+        existing_result['checkpoint_phase'] = 'normal-run'
+
+        supabase.table('simulations').update({
+            'status': 'queued',
+            'result_data': existing_result,
+        }).eq('id', job_id).execute()
+
+        logger.info(f"Checkpoint confirmed for job {job_id} by user {user_id}. Re-queued for normal-run.")
+        return {"status": "success", "message": "Checkpoint confirmed. Full simulation will start shortly."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in confirm_checkpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/simulations/{job_id}/checkpoint/reject")
+@limiter.limit("10/minute")
+async def reject_checkpoint(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    User rejects pre-run results. Marks the simulation as failed.
+    Checkpoint data is preserved in result_data for reference.
+    """
+    try:
+        response = supabase.table('simulations').select('id, user_id, status, result_data').eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if job['status'] != 'checkpoint':
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot reject: simulation status is '{job['status']}', expected 'checkpoint'."
+            )
+
+        existing_result = job.get('result_data') or {}
+        existing_result['checkpoint_phase'] = 'rejected'
+
+        supabase.table('simulations').update({
+            'status': 'failed',
+            'result_data': existing_result,
+        }).eq('id', job_id).execute()
+
+        logger.info(f"Checkpoint rejected for job {job_id} by user {user_id}. Marked as failed.")
+        return {"status": "success", "message": "Checkpoint rejected. Simulation marked as failed."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in reject_checkpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 8b. Stage confirm/reject (MCP pipeline) ---
+
+@app.post("/api/v1/simulations/{job_id}/stage/confirm")
+@limiter.limit("10/minute")
+async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    User confirms current pipeline stage, allowing the pipeline to advance.
+    Works for both 'auto' mode (checkpoint confirm) and 'controlled' mode (stage confirm).
+    """
+    try:
+        response = supabase.table('simulations').select(
+            'id, user_id, status, pipeline_mode, pipeline_stage, pipeline_state, result_data'
+        ).eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if job['status'] != 'checkpoint':
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot confirm: simulation status is '{job['status']}', expected 'checkpoint'."
+            )
+
+        pipeline_mode = job.get('pipeline_mode', 'auto')
+        pipeline_stage = job.get('pipeline_stage')
+
+        if pipeline_mode == 'auto':
+            # Delegate to existing checkpoint confirm logic
+            existing_result = job.get('result_data') or {}
+            existing_result['checkpoint_phase'] = 'normal-run'
+            supabase.table('simulations').update({
+                'status': 'queued',
+                'result_data': existing_result,
+            }).eq('id', job_id).execute()
+            msg = "Checkpoint confirmed. Full simulation will start shortly."
+        else:
+            # Controlled mode: keep pipeline_stage as-is so Worker
+            # knows which stage was confirmed and routes to the next one
+            supabase.table('simulations').update({
+                'status': 'queued',
+            }).eq('id', job_id).execute()
+            msg = f"Stage '{pipeline_stage}' confirmed. Pipeline will continue."
+
+        logger.info(f"Stage confirmed for job {job_id} (mode={pipeline_mode}, stage={pipeline_stage})")
+        return {"status": "success", "message": msg}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in confirm_stage: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/simulations/{job_id}/stage/reject")
+@limiter.limit("10/minute")
+async def reject_stage(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
+    """
+    User rejects current pipeline stage. Marks the simulation as failed.
+    Works for both 'auto' mode (checkpoint reject) and 'controlled' mode (stage reject).
+    """
+    try:
+        response = supabase.table('simulations').select(
+            'id, user_id, status, pipeline_mode, pipeline_stage, pipeline_state, result_data'
+        ).eq('id', job_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
+
+        job = response.data[0]
+        if job['user_id'] != user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if job['status'] != 'checkpoint':
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot reject: simulation status is '{job['status']}', expected 'checkpoint'."
+            )
+
+        pipeline_stage = job.get('pipeline_stage')
+        existing_result = job.get('result_data') or {}
+        existing_result['rejected_stage'] = pipeline_stage
+
+        supabase.table('simulations').update({
+            'status': 'failed',
+            'result_data': existing_result,
+        }).eq('id', job_id).execute()
+
+        logger.info(f"Stage '{pipeline_stage}' rejected for job {job_id}. Marked as failed.")
+        return {"status": "success", "message": f"Stage '{pipeline_stage}' rejected. Simulation marked as failed."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in reject_stage: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 9. Restore endpoint ---
 
 @app.post("/api/v1/simulations/{job_id}/restore")
 async def restore_simulation(job_id: str, user_id: str = Depends(verify_jwt)):

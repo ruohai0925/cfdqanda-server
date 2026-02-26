@@ -4,7 +4,7 @@ Step 006: CORS restriction tests.
 Verifies that:
 1. Allowed origins receive proper CORS headers for GET/POST.
 2. Preflight (OPTIONS) for allowed methods (GET, POST) succeeds.
-3. Preflight for disallowed methods (PUT, PATCH) is rejected; DELETE is allowed.
+3. Preflight for disallowed methods (PUT) is rejected; DELETE and PATCH are allowed.
 4. Disallowed origins are rejected.
 5. Only Content-Type and Authorization headers are allowed.
 """
@@ -79,8 +79,8 @@ class TestPreflightAllowedMethods:
         assert "GET" in resp.headers.get("access-control-allow-methods", "")
 
 
-class TestPreflightDisallowedMethods:
-    """Preflight requests for disallowed methods should be rejected."""
+class TestPreflightMethodFiltering:
+    """Preflight requests: allowed methods succeed, disallowed methods are rejected."""
 
     def test_preflight_put_rejected(self, app_client):
         """OPTIONS preflight for PUT → 400 (method not allowed by CORS)."""
@@ -105,16 +105,17 @@ class TestPreflightDisallowedMethods:
         assert resp.status_code == 200
         assert "DELETE" in resp.headers.get("access-control-allow-methods", "")
 
-    def test_preflight_patch_rejected(self, app_client):
-        """OPTIONS preflight for PATCH → 400 (method not allowed by CORS)."""
+    def test_preflight_patch_allowed(self, app_client):
+        """OPTIONS preflight for PATCH → 200 (PATCH is used by /rating endpoint)."""
         resp = app_client.options(
-            "/api/v1/simulations",
+            "/api/v1/simulations/123/rating",
             headers={
                 "Origin": ALLOWED_ORIGIN,
                 "Access-Control-Request-Method": "PATCH",
             },
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+        assert "PATCH" in resp.headers.get("access-control-allow-methods", "")
 
 
 class TestDisallowedOrigin:

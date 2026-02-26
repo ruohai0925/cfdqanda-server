@@ -609,17 +609,15 @@ class TestWorkerIntegration:
         assert 'from allrun_validator import audit_allrun_scripts' in source
 
     def test_worker_calls_audit(self):
-        """worker.py calls audit_allrun_scripts in find_and_process_job."""
+        """worker.py calls audit_allrun_scripts somewhere in the processing flow."""
         worker_path = os.path.join(
             os.path.dirname(__file__), '..', 'worker.py'
         )
         with open(worker_path, 'r') as f:
             source = f.read()
 
-        # Find the function and verify audit call is inside it
-        func_start = source.index('def find_and_process_job()')
-        func_body = source[func_start:]
-        assert 'audit_allrun_scripts(run_dir)' in func_body
+        # Verify audit call exists in the worker source (may be in a helper function)
+        assert 'audit_allrun_scripts(run_dir)' in source
 
     def test_worker_includes_audit_in_result_data(self):
         """worker.py includes allrun_audit in result_data."""
