@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import logging
@@ -567,176 +568,6 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
                f"Total files: {uploaded_count}, Failed: {failed_count}")
 
 
-def _run_pre_run_checkpoint(job, run_dir, output_path, log_path, allrun_audit, pre_run_end_time):
-    """
-    Execute pre-run checkpoint after Foam-Agent completes successfully.
-
-    Modifies controlDict (short endTime + function objects), runs a quick simulation,
-    then sets DB status to 'checkpoint' for user review.
-    """
-    job_id = job['id']
-    case_dir = output_path  # output/ is the case directory
-
-    try:
-        from pre_run_executor import PreRunExecutor
-    except ImportError:
-        logger.error(
-            f"Job {job_id}: Cannot import pre_run_executor. "
-            "Is MIDDLEWARE_DIR set correctly? Falling back to normal completion."
-        )
-        _upload_and_complete(job_id, job['user_id'], run_dir, output_path, log_path, allrun_audit)
-        return
-
-    logger.info(f"Job {job_id}: Starting pre-run checkpoint (endTime={pre_run_end_time})")
-
-    executor = PreRunExecutor(case_dir, pre_run_end_time)
-    checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
-
-    if not checkpoint_data.get('execution_result', {}).get('success', False):
-        # Pre-run itself failed — mark job as failed
-        logger.error(f"Job {job_id}: Pre-run failed, marking job as failed.")
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': 'Pre-run checkpoint simulation failed.',
-                'checkpoint_data': checkpoint_data,
-                'log_path_on_server': log_path,
-                'allrun_audit': allrun_audit,
-            }
-        }).eq('id', job_id).execute()
-        return
-
-    # Upload pre-run files so user can browse them in the frontend
-    storage_base_path = f"public/{job['user_id']}/{job_id}"
-    file_tree = build_file_tree(run_dir)
-    uploaded_count, failed_count = upload_directory_to_storage(
-        run_dir, storage_base_path, supabase
-    )
-
-    # Update DB to checkpoint status
-    supabase.table('simulations').update({
-        'status': 'checkpoint',
-        'result_data': {
-            'checkpoint_data': checkpoint_data,
-            'checkpoint_phase': 'pre-run',
-            'storage_base_path': storage_base_path,
-            'file_tree': file_tree,
-            'log_path_on_server': log_path,
-            'allrun_audit': allrun_audit,
-            'upload_stats': {
-                'uploaded': uploaded_count,
-                'failed': failed_count,
-            },
-        }
-    }).eq('id', job_id).execute()
-
-    logger.info(
-        f"Job {job_id}: Pre-run complete. Status set to 'checkpoint'. "
-        f"Waiting for user confirmation."
-    )
-
-
-def _handle_normal_run(job):
-    """
-    Execute normal-run phase after user confirms checkpoint.
-
-    Reverts pre-run modifications (restore endTime, remove function objects,
-    clean timestep dirs) and runs the full simulation via `bash Allrun`.
-    """
-    job_id = job['id']
-    result_data = job.get('result_data') or {}
-    checkpoint_data = result_data.get('checkpoint_data', {})
-    original_end_time = checkpoint_data.get('original_end_time')
-
-    run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
-    output_path = os.path.join(run_dir, "output")
-    case_dir = output_path
-    log_path = os.path.join(run_dir, "simulation_normal_run.log")
-
-    try:
-        from normal_run_preparer import NormalRunPreparer
-    except ImportError:
-        logger.error(
-            f"Job {job_id}: Cannot import normal_run_preparer. "
-            "Is MIDDLEWARE_DIR set correctly?"
-        )
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': 'Cannot import normal_run_preparer middleware module.',
-                **result_data,
-            }
-        }).eq('id', job_id).execute()
-        return
-
-    if not original_end_time:
-        logger.error(f"Job {job_id}: No original_end_time in checkpoint_data.")
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': 'Missing original_end_time in checkpoint_data.',
-                **result_data,
-            }
-        }).eq('id', job_id).execute()
-        return
-
-    logger.info(f"Job {job_id}: Preparing normal-run (restoring endTime={original_end_time})")
-
-    try:
-        preparer = NormalRunPreparer(case_dir, original_end_time)
-        preparer.prepare()
-    except Exception as e:
-        logger.error(f"Job {job_id}: Failed to prepare normal-run: {e}", exc_info=True)
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': f'Normal-run preparation failed: {str(e)}',
-                **result_data,
-            }
-        }).eq('id', job_id).execute()
-        return
-
-    # Run bash Allrun directly (skip Foam-Agent pipeline)
-    # Must source OpenFOAM environment first (matching Foam-Agent's run_command pattern)
-    allrun_abs = os.path.abspath(os.path.join(case_dir, "Allrun"))
-    wm_project_dir = os.environ.get("WM_PROJECT_DIR", "/opt/openfoam10")
-    bashrc_path = os.path.join(wm_project_dir, "etc", "bashrc")
-    if os.path.isfile(bashrc_path):
-        normal_run_cmd = ["bash", "-c", f"source {bashrc_path} && bash {allrun_abs}"]
-    else:
-        normal_run_cmd = ["bash", allrun_abs]
-        logger.warning(f"Job {job_id}: OpenFOAM bashrc not found at {bashrc_path}")
-
-    logger.info(f"Job {job_id}: Executing normal-run: bash Allrun")
-    returncode, cancelled, timed_out = _run_subprocess_with_polling(
-        command=normal_run_cmd,
-        cwd=case_dir,
-        env=os.environ.copy(),
-        log_path=log_path,
-        job_id=job_id,
-        timeout=SIMULATION_TIMEOUT,
-    )
-
-    if _handle_cancelled_or_timeout(job_id, log_path, cancelled, timed_out):
-        return
-
-    allrun_audit = _run_allrun_audit(run_dir, job_id)
-
-    if returncode == 0:
-        logger.info(f"Job {job_id}: Normal-run completed successfully.")
-        _upload_and_complete(job_id, job['user_id'], run_dir, output_path, log_path, allrun_audit)
-    else:
-        logger.error(f"Job {job_id}: Normal-run failed with return code {returncode}")
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': f"Normal-run Allrun failed with return code {returncode}.",
-                'log_path_on_server': log_path,
-                'allrun_audit': allrun_audit,
-            }
-        }).eq('id', job_id).execute()
-
-
 # --- 7. MCP controlled pipeline ---
 
 # MCP server port for controlled pipeline mode
@@ -777,6 +608,72 @@ def _append_mcp_log(job_id, stage, message):
         f.write(f"[{timestamp}] [{stage}] {message}\n")
 
 
+def _collect_case_errors(case_dir):
+    """Collect OpenFOAM error messages from log files in the case directory.
+
+    Reads log.* files and Allrun.err / Allrun.pre-run.err looking for FOAM FATAL
+    ERROR blocks and non-empty stderr output.  Returns a list of error strings
+    suitable for passing to MCP review().
+    """
+    errors = []
+    if not case_dir or not os.path.isdir(case_dir):
+        return errors
+
+    for entry in os.listdir(case_dir):
+        entry_path = os.path.join(case_dir, entry)
+        if not os.path.isfile(entry_path):
+            continue
+
+        # Check log.* files for FOAM FATAL ERROR
+        if entry.startswith("log."):
+            try:
+                with open(entry_path, 'r') as f:
+                    content = f.read()
+                if "FOAM FATAL ERROR" in content or "FOAM FATAL IO ERROR" in content:
+                    # Extract last 2000 chars for context
+                    snippet = content[-2000:] if len(content) > 2000 else content
+                    errors.append(f"{entry}: {snippet}")
+            except Exception:
+                pass
+
+        # Check stderr files
+        if entry in ("Allrun.err", "Allrun.pre-run.err"):
+            try:
+                with open(entry_path, 'r') as f:
+                    content = f.read().strip()
+                if content:
+                    errors.append(f"{entry}: {content[:2000]}")
+            except Exception:
+                pass
+
+    return errors
+
+
+def _sanitize_case_dir(case_dir):
+    """Rename case directory to remove shell-unsafe characters like ().
+
+    Foam-Agent's utils.run_command() builds an unquoted bash command from the
+    directory path.  Characters such as () cause bash syntax errors and are not
+    modifiable because Foam-Agent code is read-only.  Sanitizing the directory
+    name right after input_writer() returns prevents all downstream failures.
+    """
+    if not case_dir or not os.path.isdir(case_dir):
+        return case_dir
+    parent = os.path.dirname(case_dir)
+    basename = os.path.basename(case_dir)
+    sanitized = re.sub(r'[()&;|`$!]', '', basename)
+    sanitized = re.sub(r'_+', '_', sanitized).strip('_')
+    if sanitized != basename:
+        new_case_dir = os.path.join(parent, sanitized)
+        if os.path.exists(new_case_dir):
+            # Avoid collision — append a short suffix
+            new_case_dir = new_case_dir + '_1'
+        os.rename(case_dir, new_case_dir)
+        logger.info(f"Sanitized case dir: {basename} -> {os.path.basename(new_case_dir)}")
+        return new_case_dir
+    return case_dir
+
+
 def _update_pipeline_state(job_id, stage, status, pipeline_state, extra_fields=None):
     """Helper to update pipeline stage, status, and state in DB."""
     update_data = {
@@ -797,10 +694,10 @@ def _handle_controlled_pipeline(job):
         None         → plan()          → plan_review (if checkpoint) or generating
         plan_review  → input_writer()  → files_review (if checkpoint) or pre_running
         files_review → pre-run         → pre_run_review (if checkpoint) or running
-        pre_run_review → full run()    → reviewing
-        running      → full run done   → reviewing
-        reviewing    → review+fix loop → visualizing
-        visualizing  → visualization() → completed
+        pre_run_review → full run()    → completed
+        running      → full run done   → completed
+
+    Review+fix loop is in pre-run stage (cheap, 10 timesteps), not full run.
 
     The stage transitions are driven by the DB pipeline_stage value:
     - None / new job: start from plan
@@ -913,8 +810,9 @@ async def _mcp_stage_input_writer(job, pipeline_state, active_checkpoints):
             case_category=pipeline_state['case_category'],
         )
 
-    # Save file generation result
+    # Save file generation result (sanitize directory name for bash safety)
     case_dir = files_result.get('case_dir', '')
+    case_dir = _sanitize_case_dir(case_dir)
     pipeline_state['case_dir'] = case_dir
     pipeline_state['allrun_script'] = files_result.get('allrun_script', '')
 
@@ -991,17 +889,67 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
 
     logger.info(f"Job {job_id}: starting pre-run (endTime={pre_run_end_time})")
     _append_mcp_log(job_id, 'pre_run', f"Starting pre-run (endTime={pre_run_end_time})")
+
+    max_pre_run_fix_loops = 3
+    pre_run_fix_count = 0
     executor = PreRunExecutor(case_dir, pre_run_end_time)
     checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
 
+    # Review+fix loop: if pre-run fails, use MCP review/apply_fixes and retry
+    while (not checkpoint_data.get('execution_result', {}).get('success', False)
+           and pre_run_fix_count < max_pre_run_fix_loops):
+        pre_run_fix_count += 1
+        errors = _collect_case_errors(case_dir)
+        if not errors:
+            _append_mcp_log(job_id, 'pre_run',
+                            f"Pre-run failed but no parseable errors found, cannot auto-fix")
+            break
+
+        logger.info(f"Job {job_id}: pre-run failed with {len(errors)} errors, "
+                    f"review+fix {pre_run_fix_count}/{max_pre_run_fix_loops}")
+        _append_mcp_log(job_id, 'pre_run',
+                        f"FAILED — review+fix loop {pre_run_fix_count}/{max_pre_run_fix_loops} "
+                        f"({len(errors)} errors)")
+        _update_pipeline_state(job_id, 'reviewing', 'running', pipeline_state)
+
+        mgr = _get_mcp_server_manager()
+        from mcp_client import FoamAgentMCPClient
+        client = FoamAgentMCPClient(mgr.url)
+
+        async with client:
+            review_result = await client.review(
+                case_dir=case_dir,
+                errors=errors,
+                user_requirement=job['prompt'],
+            )
+            analysis = review_result.get('analysis', '')
+
+            fix_result = await client.apply_fixes(
+                case_dir=case_dir,
+                error_logs=errors,
+                review_analysis=analysis,
+                user_requirement=job['prompt'],
+            )
+            _append_mcp_log(job_id, 'pre_run',
+                            f"Applied fixes ({fix_result.get('status')}), retrying pre-run")
+            logger.info(f"Job {job_id}: applied fixes ({fix_result.get('status')}), "
+                        f"retrying pre-run")
+
+        _update_pipeline_state(job_id, 'pre_running', 'running', pipeline_state)
+        executor = PreRunExecutor(case_dir, pre_run_end_time)
+        checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
+
+    pipeline_state['pre_run_fix_count'] = pre_run_fix_count
+
     if not checkpoint_data.get('execution_result', {}).get('success', False):
-        _append_mcp_log(job_id, 'pre_run', 'Pre-run FAILED')
-        logger.error(f"Job {job_id}: pre-run failed")
+        _append_mcp_log(job_id, 'pre_run',
+                        f'Pre-run FAILED after {pre_run_fix_count} fix attempts')
+        logger.error(f"Job {job_id}: pre-run failed after {pre_run_fix_count} fix attempts")
         supabase.table('simulations').update({
             'status': 'failed',
             'pipeline_stage': 'pre_running',
             'result_data': {
-                'error': 'Pre-run simulation failed.',
+                'error': f'Pre-run simulation failed after {pre_run_fix_count} fix attempts.',
                 'checkpoint_data': checkpoint_data,
             },
         }).eq('id', job_id).execute()
@@ -1080,7 +1028,12 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
 
 
 async def _mcp_stage_full_run(job, pipeline_state):
-    """Execute full simulation via MCP run(), then review+fix loop, then visualization."""
+    """Execute full simulation via MCP run().
+
+    No review+fix loop here — errors are caught and fixed during pre-run
+    (which is cheap at 10 timesteps).  Full run just executes the final
+    simulation with the already-validated configuration.
+    """
     job_id = job['id']
     case_dir = pipeline_state.get('case_dir', '')
 
@@ -1108,71 +1061,18 @@ async def _mcp_stage_full_run(job, pipeline_state):
     from mcp_client import FoamAgentMCPClient
     client = FoamAgentMCPClient(mgr.url)
 
-    # Run simulation via MCP (includes review+fix loop internally in Foam-Agent)
+    # Run simulation — no review+fix loop; errors already fixed during pre-run
     async with client:
         run_result = await client.run(case_dir, timeout=SIMULATION_TIMEOUT)
 
         errors = run_result.get('errors', [])
         _append_mcp_log(job_id, 'run',
                         f"Completed: status={run_result.get('status')}, errors={len(errors)}")
-        max_review_loops = 5
-        loop_count = 0
-
-        while errors and loop_count < max_review_loops:
-            loop_count += 1
-            logger.info(f"Job {job_id}: run had {len(errors)} errors, "
-                        f"review+fix loop {loop_count}/{max_review_loops}")
-            _append_mcp_log(job_id, 'review',
-                            f"Review+fix loop {loop_count}/{max_review_loops} "
-                            f"({len(errors)} errors)")
-
-            _update_pipeline_state(job_id, 'reviewing', 'running', pipeline_state)
-
-            review_result = await client.review(
-                case_dir=case_dir,
-                errors=errors,
-                user_requirement=job['prompt'],
-            )
-            analysis = review_result.get('analysis', '')
-
-            fix_result = await client.apply_fixes(
-                case_dir=case_dir,
-                error_logs=errors,
-                review_analysis=analysis,
-                user_requirement=job['prompt'],
-            )
-            _append_mcp_log(job_id, 'review',
-                            f"Applied fixes ({fix_result.get('status')}), re-running")
-            logger.info(f"Job {job_id}: applied fixes ({fix_result.get('status')}), "
-                        f"re-running simulation")
-
-            _update_pipeline_state(job_id, 'running', 'running', pipeline_state)
-            run_result = await client.run(case_dir, timeout=SIMULATION_TIMEOUT)
-            errors = run_result.get('errors', [])
-
-        pipeline_state['review_loop_count'] = loop_count
 
         if errors:
             _append_mcp_log(job_id, 'run',
-                            f"WARNING: {len(errors)} errors remain after "
-                            f"{max_review_loops} fix loops")
-            logger.warning(f"Job {job_id}: simulation still has {len(errors)} errors "
-                           f"after {max_review_loops} fix loops")
-
-        # Visualization
-        _update_pipeline_state(job_id, 'visualizing', 'running', pipeline_state)
-        _append_mcp_log(job_id, 'visualization', 'Starting visualization ...')
-        try:
-            viz_result = await client.visualization(case_dir=case_dir)
-            pipeline_state['visualization_artifacts'] = viz_result.get('artifacts', [])
-            _append_mcp_log(job_id, 'visualization',
-                            f"Completed: {len(pipeline_state['visualization_artifacts'])} artifacts")
-            logger.info(f"Job {job_id}: visualization generated "
-                        f"({len(pipeline_state['visualization_artifacts'])} artifacts)")
-        except Exception as e:
-            logger.warning(f"Job {job_id}: visualization failed: {e}")
-            _append_mcp_log(job_id, 'visualization', f"FAILED: {e}")
-            pipeline_state['visualization_artifacts'] = []
+                            f"WARNING: {len(errors)} errors in full run")
+            logger.warning(f"Job {job_id}: full run had {len(errors)} errors")
 
     # Upload results and complete
     run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
@@ -1184,7 +1084,7 @@ async def _mcp_stage_full_run(job, pipeline_state):
     _append_mcp_log(job_id, 'summary',
                     f"Case={pipeline_state.get('case_name')}, "
                     f"Solver={pipeline_state.get('case_solver')}, "
-                    f"ReviewLoops={loop_count}, "
+                    f"PreRunFixLoops={pipeline_state.get('pre_run_fix_count', 0)}, "
                     f"FinalStatus={run_result.get('status')}, "
                     f"RemainingErrors={len(errors)}")
 
@@ -1204,9 +1104,9 @@ def find_and_process_job():
     selects and locks the next queued job using FOR UPDATE SKIP LOCKED,
     preventing multiple Workers from claiming the same job.
 
-    Supports checkpoint mechanism:
-    - New jobs: run Foam-Agent → optional pre-run → checkpoint status
-    - Confirmed jobs (checkpoint_phase='normal-run'): run bash Allrun directly
+    Routes based on pipeline_mode:
+    - 'controlled': MCP stage-by-stage pipeline with optional checkpoints
+    - 'auto' (default): Foam-Agent subprocess one-shot execution
     """
     # Atomically claim the next queued job via RPC.
     response = supabase.rpc('claim_next_job').execute()
@@ -1217,15 +1117,6 @@ def find_and_process_job():
     job = response.data[0]
     job_id = job['id']
     logger.info(f"Claimed job {job_id} via claim_next_job() RPC. Processing...")
-
-    # Check if this is a normal-run phase (user confirmed checkpoint)
-    result_data = job.get('result_data') or {}
-    checkpoint_phase = result_data.get('checkpoint_phase')
-
-    if checkpoint_phase == 'normal-run':
-        logger.info(f"Job {job_id}: Checkpoint confirmed, executing normal-run phase.")
-        _handle_normal_run(job)
-        return True
 
     # --- Controlled pipeline mode: MCP stage-by-stage ---
     pipeline_mode = job.get('pipeline_mode', 'auto')
@@ -1320,28 +1211,9 @@ def find_and_process_job():
         # Handle completion based on return code
         if returncode == 0:
             logger.info(f"Job {job_id} Foam-Agent completed successfully.")
-
-            # Determine pre-run behavior
-            pre_run_end_time = job.get('pre_run_end_time')
-            if pre_run_end_time is None:
-                pre_run_end_time = 10  # Default: 10 timesteps
-
-            if pre_run_end_time == -1 or not MIDDLEWARE_DIR:
-                # Pre-run disabled or middleware not configured — original flow
-                if pre_run_end_time == -1:
-                    logger.info(f"Job {job_id}: Pre-run disabled (pre_run_end_time=-1), "
-                               "proceeding with normal completion.")
-                else:
-                    logger.info(f"Job {job_id}: MIDDLEWARE_DIR not set, "
-                               "skipping pre-run checkpoint.")
-                _upload_and_complete(
-                    job_id, job['user_id'], run_dir, output_path, log_path, allrun_audit
-                )
-            else:
-                # Run pre-run checkpoint
-                _run_pre_run_checkpoint(
-                    job, run_dir, output_path, log_path, allrun_audit, pre_run_end_time
-                )
+            _upload_and_complete(
+                job_id, job['user_id'], run_dir, output_path, log_path, allrun_audit
+            )
         else:
             logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
             supabase.table('simulations').update({

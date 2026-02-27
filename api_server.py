@@ -448,100 +448,18 @@ async def cancel_simulation(request: Request, job_id: str, user_id: str = Depend
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- 8. Checkpoint endpoints ---
-
-@app.post("/api/v1/simulations/{job_id}/checkpoint/confirm")
-@limiter.limit("10/minute")
-async def confirm_checkpoint(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
-    """
-    User confirms pre-run results, proceed to normal-run.
-    Sets checkpoint_phase to 'normal-run' and status back to 'queued'
-    so the Worker picks it up and runs the full simulation.
-    """
-    try:
-        response = supabase.table('simulations').select('id, user_id, status, result_data').eq('id', job_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
-
-        job = response.data[0]
-        if job['user_id'] != user_id:
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if job['status'] != 'checkpoint':
-            raise HTTPException(
-                status_code=409,
-                detail=f"Cannot confirm: simulation status is '{job['status']}', expected 'checkpoint'."
-            )
-
-        # Update checkpoint_phase and re-queue
-        existing_result = job.get('result_data') or {}
-        existing_result['checkpoint_phase'] = 'normal-run'
-
-        supabase.table('simulations').update({
-            'status': 'queued',
-            'result_data': existing_result,
-        }).eq('id', job_id).execute()
-
-        logger.info(f"Checkpoint confirmed for job {job_id} by user {user_id}. Re-queued for normal-run.")
-        return {"status": "success", "message": "Checkpoint confirmed. Full simulation will start shortly."}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in confirm_checkpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/v1/simulations/{job_id}/checkpoint/reject")
-@limiter.limit("10/minute")
-async def reject_checkpoint(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
-    """
-    User rejects pre-run results. Marks the simulation as failed.
-    Checkpoint data is preserved in result_data for reference.
-    """
-    try:
-        response = supabase.table('simulations').select('id, user_id, status, result_data').eq('id', job_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
-
-        job = response.data[0]
-        if job['user_id'] != user_id:
-            raise HTTPException(status_code=403, detail="Permission denied")
-        if job['status'] != 'checkpoint':
-            raise HTTPException(
-                status_code=409,
-                detail=f"Cannot reject: simulation status is '{job['status']}', expected 'checkpoint'."
-            )
-
-        existing_result = job.get('result_data') or {}
-        existing_result['checkpoint_phase'] = 'rejected'
-
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': existing_result,
-        }).eq('id', job_id).execute()
-
-        logger.info(f"Checkpoint rejected for job {job_id} by user {user_id}. Marked as failed.")
-        return {"status": "success", "message": "Checkpoint rejected. Simulation marked as failed."}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in reject_checkpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# --- 8b. Stage confirm/reject (MCP pipeline) ---
+# --- 8. Stage confirm/reject (controlled pipeline) ---
 
 @app.post("/api/v1/simulations/{job_id}/stage/confirm")
 @limiter.limit("10/minute")
 async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
     """
     User confirms current pipeline stage, allowing the pipeline to advance.
-    Works for both 'auto' mode (checkpoint confirm) and 'controlled' mode (stage confirm).
+    Only used by controlled pipeline mode. Re-queues the job so Worker picks it up.
     """
     try:
         response = supabase.table('simulations').select(
-            'id, user_id, status, pipeline_mode, pipeline_stage, pipeline_state, result_data'
+            'id, user_id, status, pipeline_stage'
         ).eq('id', job_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
@@ -555,28 +473,16 @@ async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(ve
                 detail=f"Cannot confirm: simulation status is '{job['status']}', expected 'checkpoint'."
             )
 
-        pipeline_mode = job.get('pipeline_mode', 'auto')
         pipeline_stage = job.get('pipeline_stage')
 
-        if pipeline_mode == 'auto':
-            # Delegate to existing checkpoint confirm logic
-            existing_result = job.get('result_data') or {}
-            existing_result['checkpoint_phase'] = 'normal-run'
-            supabase.table('simulations').update({
-                'status': 'queued',
-                'result_data': existing_result,
-            }).eq('id', job_id).execute()
-            msg = "Checkpoint confirmed. Full simulation will start shortly."
-        else:
-            # Controlled mode: keep pipeline_stage as-is so Worker
-            # knows which stage was confirmed and routes to the next one
-            supabase.table('simulations').update({
-                'status': 'queued',
-            }).eq('id', job_id).execute()
-            msg = f"Stage '{pipeline_stage}' confirmed. Pipeline will continue."
+        # Keep pipeline_stage as-is so Worker knows which stage was confirmed
+        # and routes to the next one
+        supabase.table('simulations').update({
+            'status': 'queued',
+        }).eq('id', job_id).execute()
 
-        logger.info(f"Stage confirmed for job {job_id} (mode={pipeline_mode}, stage={pipeline_stage})")
-        return {"status": "success", "message": msg}
+        logger.info(f"Stage confirmed for job {job_id} (stage={pipeline_stage})")
+        return {"status": "success", "message": f"Stage '{pipeline_stage}' confirmed. Pipeline will continue."}
 
     except HTTPException:
         raise
@@ -590,7 +496,7 @@ async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(ve
 async def reject_stage(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
     """
     User rejects current pipeline stage. Marks the simulation as failed.
-    Works for both 'auto' mode (checkpoint reject) and 'controlled' mode (stage reject).
+    Used by controlled pipeline mode. Preserves result_data for reference.
     """
     try:
         response = supabase.table('simulations').select(
