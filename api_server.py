@@ -637,10 +637,12 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
         total_bytes = 0
         task_count = len(response.data)
         breakdown = {}
+        per_task = {}  # task_id -> bytes
 
         for row in response.data:
             status = row.get('status', 'unknown')
             breakdown[status] = breakdown.get(status, 0) + 1
+            task_bytes = 0
 
             rd = row.get('result_data') or {}
             stats = rd.get('upload_stats') or {}
@@ -648,18 +650,23 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
 
             if recorded is not None and recorded > 0:
                 # New tasks: use pre-recorded value (fast)
-                total_bytes += recorded
+                task_bytes = recorded
             else:
                 # Historical tasks: query Storage metadata (fallback)
                 storage_base = rd.get('storage_base_path')
                 if storage_base:
-                    total_bytes += _get_storage_dir_size(storage_base)
+                    task_bytes = _get_storage_dir_size(storage_base)
+
+            total_bytes += task_bytes
+            if task_bytes > 0:
+                per_task[str(row['id'])] = task_bytes
 
         result = {
             "total_bytes": total_bytes,
             "total_display": _format_bytes(total_bytes),
             "task_count": task_count,
             "breakdown": breakdown,
+            "per_task": per_task,
         }
 
         # Cache the result
