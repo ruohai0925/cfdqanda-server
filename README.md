@@ -1,66 +1,53 @@
 # cfdqanda-server
 
-> **License:** [PolyForm Strict 1.0.0](https://polyformproject.org/licenses/strict/1.0.0/) — source available for personal and non-commercial use only. Commercial use is prohibited.
+> **License:** [PolyForm Strict 1.0.0](https://polyformproject.org/licenses/strict/1.0.0/) — source available for personal and non-commercial use only.
 
 Platform server layer for [CFDQandA](https://cfdqanda.com) — a natural-language-driven CFD simulation platform.
 
-This repository contains the **API server** (FastAPI) and **background worker** that bridge the React frontend with the [Foam-Agent](https://github.com/YYgroup/Foam-Agent) simulation engine.
+Contains the API server (FastAPI) and background worker that bridge the React frontend with the Foam-Agent simulation engine.
 
 ## Architecture
 
 ```
-Browser (React)
-    │
-    ▼
-API Server (FastAPI, port 8000)
-    │
-    ▼
-Supabase (PostgreSQL + Storage + Realtime + Auth)
-    ▲
-    │
-Worker (polling loop)
-    │
-    ▼
-Foam-Agent subprocess (LangGraph → OpenFOAM)
+Browser (React)  ──►  API Server (FastAPI, port 8000)  ──►  Supabase (PostgreSQL + Storage + Realtime + Auth)
+                                                                     ▲
+                                                                     │
+                                                              Worker (polling loop)
+                                                                     │
+                                                                     ▼
+                                                              Foam-Agent subprocess
+                                                              (LangGraph → OpenFOAM)
 ```
 
-The server does **not** contain any simulation logic. It only:
+Two execution modes:
 
-1. Receives task requests from the frontend and inserts them into Supabase
-2. Polls Supabase for queued tasks and launches Foam-Agent as a subprocess
-3. Uploads results to Supabase Storage after completion
+- **Auto mode** (`pipeline_mode='auto'`): Foam-Agent runs as a single subprocess to completion
+- **Controlled mode** (`pipeline_mode='controlled'`): Stage-by-stage MCP pipeline with user-reviewable checkpoints
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `api_server.py` | FastAPI application — endpoints for task creation, file tree retrieval, and feedback submission |
-| `worker.py` | Background worker — polls Supabase for queued jobs, launches Foam-Agent subprocess, uploads results |
-| `app.py` | Minimal health-check endpoint (for MCP transport) |
-| `.env` | Environment variables (not committed) |
-| `.env.example` | Template for `.env` |
+| `api_server.py` | FastAPI application — 11 REST endpoints for task management, file browsing, feedback, and storage |
+| `worker.py` | Background worker — polls Supabase for jobs, launches Foam-Agent, uploads results, manages data lifecycle |
+| `mcp_client.py` | MCP client for controlled pipeline mode (plan, input_writer, run, review, apply_fixes, visualization) |
+| `allrun_validator.py` | Security audit for OpenFOAM Allrun scripts (whitelist-based command validation) |
+| `token_extractor.py` | Extracts LLM token usage statistics from simulation logs |
+| `.env.example` | Environment variables template |
+| `tests/` | 13 test files covering auth, security, concurrency, pipeline, etc. |
 
 ## Prerequisites
 
-- **Foam-Agent** repository cloned locally (this server calls it via subprocess)
-- **Conda environments** set up:
-  - `foam-api` — for running the API server (`fastapi`, `uvicorn`, `supabase`, `python-dotenv`)
-  - `FoamAgent` — for running the worker (inherits Foam-Agent's full dependency stack)
-- **Supabase** project with `simulations` table and `simulation_results` storage bucket
-- **OpenFOAM v10** installed (required by Foam-Agent)
+- Foam-Agent repository cloned locally
+- Conda environments: `foam-api` (API server), `FoamAgent` (worker)
+- Supabase project with `simulations` table and `simulation_results` storage bucket
+- OpenFOAM v10 installed
 
 ## Setup
 
-1. Copy `.env.example` to `.env` and fill in all values:
-
 ```bash
 cp .env.example .env
-```
-
-2. The most important variable is `FOAM_AGENT_DIR` — set it to the **absolute path** of the Foam-Agent directory:
-
-```
-FOAM_AGENT_DIR=/home/youruser/path/to/Foam-Agent
+# Fill in all values, especially FOAM_AGENT_DIR
 ```
 
 ## Running
@@ -68,7 +55,6 @@ FOAM_AGENT_DIR=/home/youruser/path/to/Foam-Agent
 ### API Server
 
 ```bash
-cd cfdqanda-server
 conda activate foam-api
 uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
@@ -76,57 +62,92 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 ### Worker
 
 ```bash
-cd cfdqanda-server
 conda activate FoamAgent
 python -u worker.py
 ```
 
-### Background mode (production)
+### Background mode
 
 ```bash
 nohup uvicorn api_server:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
 nohup python -u worker.py > worker.log 2>&1 &
 ```
 
-### Stopping services
+### Stopping
 
 ```bash
-# Use pkill -f (matches full command line) instead of kill $PID.
-# nohup returns the bash wrapper PID, not the actual Python process.
 pkill -f "python.*worker\.py"
 pkill -f "uvicorn api_server:app"
 ```
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check |
-| `POST` | `/api/v1/simulations` | Create a new simulation task |
-| `GET` | `/api/v1/simulations/{job_id}/files` | Get file tree for a completed job |
-| `POST` | `/api/v1/simulations/{job_id}/feedback` | Submit feedback on a specific file |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/` | — | Health check |
+| `POST` | `/api/v1/simulations` | JWT | Create a new simulation task |
+| `GET` | `/api/v1/simulations/{id}/files` | JWT | Get file tree for a job |
+| `POST` | `/api/v1/simulations/{id}/feedback` | JWT | Submit feedback on a specific file |
+| `PATCH` | `/api/v1/simulations/{id}/rating` | JWT | Submit task-level rating (1-3) |
+| `DELETE` | `/api/v1/simulations/{id}` | JWT | Soft-delete a task |
+| `POST` | `/api/v1/simulations/{id}/cancel` | JWT | Cancel a running task |
+| `POST` | `/api/v1/simulations/{id}/stage/confirm` | JWT | Confirm a pipeline checkpoint |
+| `POST` | `/api/v1/simulations/{id}/stage/reject` | JWT | Reject a pipeline checkpoint |
+| `POST` | `/api/v1/simulations/{id}/restore` | JWT | Restore a soft-deleted task |
+| `GET` | `/api/v1/user/storage` | JWT | Get user's cloud storage usage summary |
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `FOAM_AGENT_DIR` | Yes | Absolute path to the Foam-Agent repository |
-| `SUPABASE_URL` | Yes | Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | Yes | Supabase service_role key (bypasses RLS) |
-| `OPENAI_API_KEY` | No | Default OpenAI API key (used when user does not provide their own) |
-| `WM_PROJECT_DIR` | No | OpenFOAM installation path (default: `/opt/openfoam10`) |
-| `EXTRA_CORS_ORIGINS` | No | Additional CORS origins, comma-separated |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `FOAM_AGENT_DIR` | Yes | — | Absolute path to the Foam-Agent repository |
+| `SUPABASE_URL` | Yes | — | Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | Yes | — | Supabase service_role key (bypasses RLS) |
+| `SUPABASE_JWT_SECRET` | Yes | — | Supabase JWT secret for token verification |
+| `OPENAI_API_KEY` | No | — | Default OpenAI API key (used for embeddings) |
+| `WM_PROJECT_DIR` | No | `/opt/openfoam10` | OpenFOAM installation path |
+| `EXTRA_CORS_ORIGINS` | No | — | Additional CORS origins (comma-separated) |
+| `MIDDLEWARE_DIR` | No | — | Path to cfdqanda-middleware for checkpoint modules |
+| `SIMULATION_TIMEOUT` | No | `3600` | Subprocess timeout in seconds |
+| `STALE_JOB_THRESHOLD` | No | `7200` | Seconds before a running job is considered stale |
+| `MCP_SERVER_PORT` | No | `7860` | MCP server port for controlled pipeline |
 
 ## How It Works
 
+### Auto Mode (default)
+
 1. User submits a simulation prompt via the frontend
-2. API server inserts a row into Supabase `simulations` table with `status='queued'`
-3. Worker polls the table every 10 seconds, picks up the job, sets `status='running'`
-4. Worker writes `prompt.txt` to `Foam-Agent/runs/{job_id}/` and launches Foam-Agent as a subprocess with `cwd=FOAM_AGENT_DIR`
-5. On success: worker builds a file tree, creates a ZIP archive, uploads everything to Supabase Storage, sets `status='completed'`
-6. On failure: worker sets `status='failed'` with error details
-7. Frontend receives real-time status updates via Supabase Realtime
+2. API server inserts a row into Supabase with `status='queued'`
+3. Worker polls the table, picks up the job, sets `status='running'`
+4. Worker launches Foam-Agent as a subprocess with `cwd=FOAM_AGENT_DIR`
+5. On completion: uploads all files to Supabase Storage, sets `status='completed'`
+6. On failure: uploads whatever files exist, sets `status='failed'` with error details
+7. Frontend receives real-time updates via Supabase Realtime
+
+### Controlled Pipeline Mode (MCP)
+
+Stage-by-stage execution with optional user checkpoints:
+
+```
+plan → [plan_review] → input_writer → [files_review] → pre-run → [pre_run_review] → full run → completed
+```
+
+Stages in brackets are optional checkpoints. At each checkpoint the frontend shows a review panel where the user can browse files, leave feedback, then confirm or reject.
+
+### Data Lifecycle
+
+- Failed tasks: auto-expire after 7 days
+- Completed tasks: auto-expire after 14 days
+- Soft-deleted tasks: permanently purged after 3 days
+- All files (success and failure) are uploaded to Supabase Storage
 
 ### BYOK (Bring Your Own Key)
 
-Users can optionally provide their own LLM configuration (provider, model version, API key) when submitting a task. The worker injects these as environment variables into the Foam-Agent subprocess and **immediately deletes** the API key from the database after reading it.
+Users can provide their own LLM config (provider, model, API key). The worker injects it as environment variables and immediately deletes the key from the database.
+
+## Tests
+
+```bash
+conda activate foam-api
+python -m pytest tests/ -v
+```

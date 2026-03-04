@@ -228,8 +228,8 @@ def upload_directory_to_storage(local_dir, storage_base_path, supabase_client):
                 try:
                     # 尝试删除已存在的文件（如果有）
                     supabase_client.storage.from_("simulation_results").remove([storage_file_path])
-                except:
-                    pass  # 如果文件不存在，忽略错误
+                except Exception:
+                    pass  # Ignore if file doesn't exist
 
                 # 上传文件
                 supabase_client.storage.from_("simulation_results").upload(

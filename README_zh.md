@@ -20,33 +20,41 @@ Supabase（PostgreSQL + Storage + Realtime + Auth）
     │
 Worker（轮询循环）
     │
-    ▼
-Foam-Agent 子进程（LangGraph → OpenFOAM）
+    ├─ [自动模式] Foam-Agent 子进程（LangGraph → OpenFOAM）
+    │
+    └─ [受控模式] MCP 客户端 → Foam-Agent MCP 服务器（分步执行 + 用户检查点）
 ```
 
 服务器**不包含任何仿真逻辑**，只负责：
 
 1. 接收前端的任务请求，写入 Supabase 数据库
-2. 轮询 Supabase 中排队的任务，启动 Foam-Agent 子进程执行
+2. 轮询 Supabase 中排队的任务，启动 Foam-Agent 执行
 3. 任务完成后将结果上传到 Supabase Storage
+
+支持两种执行模式：
+
+- **自动模式（`auto`）**：Foam-Agent 作为子进程一次性运行完整仿真流程（规划 → 生成 → 运行 → 纠错 → 可视化）
+- **受控模式（`controlled`）**：通过 MCP 协议分步调用 Foam-Agent（规划 → 文件生成 → 预运行 → 完整运行），支持在任意阶段暂停等待用户确认
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| `api_server.py` | FastAPI 应用 —— 任务创建、文件树查询、反馈提交等接口 |
-| `worker.py` | 后台 Worker —— 轮询任务队列、启动 Foam-Agent 子进程、上传结果 |
-| `app.py` | 简单的健康检查端点（MCP 传输用） |
+| `api_server.py` | FastAPI 应用 —— JWT 鉴权、任务创建、文件树查询、反馈/评价提交、软删除/恢复、流水线检查点确认/拒绝、存储用量查询 |
+| `worker.py` | 后台 Worker —— 轮询任务队列、启动 Foam-Agent 执行（自动/受控两种模式）、上传结果、stale job 恢复、数据清理（TTL + purge） |
+| `mcp_client.py` | MCP 客户端 —— 管理 Foam-Agent MCP 服务器进程，提供异步接口调用 `plan()`、`input_writer()`、`run()`、`review()`、`apply_fixes()` |
+| `allrun_validator.py` | Allrun 安全审计 —— 解析 Allrun 脚本，检测危险命令（`rm -rf`、`curl` 等），白名单验证 |
+| `token_extractor.py` | Token 用量提取 —— 从仿真日志中解析 LLM API 调用的 token 消耗 |
 | `.env` | 环境变量（不提交到 git） |
 | `.env.example` | `.env` 模板 |
 
 ## 前置条件
 
-- **Foam-Agent** 仓库已克隆到本地（服务器通过子进程调用它）
+- **Foam-Agent** 仓库已克隆到本地（服务器通过子进程/MCP 调用它）
 - **Conda 环境** 已创建：
-  - `foam-api` —— 运行 API 服务器（`fastapi`, `uvicorn`, `supabase`, `python-dotenv`）
+  - `foam-api` —— 运行 API 服务器（`fastapi`, `uvicorn`, `supabase`, `pydantic`, `python-dotenv`, `PyJWT`, `slowapi`）
   - `FoamAgent` —— 运行 Worker（继承 Foam-Agent 的完整依赖）
-- **Supabase** 项目已配置（`simulations` 表 + `simulation_results` 存储桶）
+- **Supabase** 项目已配置（`simulations` 表 + `simulation_results` 存储桶 + `claim_next_job` RPC 函数）
 - **OpenFOAM v10** 已安装（Foam-Agent 需要）
 
 ## 安装配置
@@ -99,12 +107,21 @@ pkill -f "uvicorn api_server:app"
 
 ## API 接口
 
+所有 POST/PATCH/DELETE 端点均需要 Supabase JWT（`Authorization: Bearer <token>`）。`user_id` 从 JWT 的 `sub` claim 中提取，不再由请求体传入。
+
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/` | 健康检查 |
-| `POST` | `/api/v1/simulations` | 创建新的仿真任务 |
-| `GET` | `/api/v1/simulations/{job_id}/files` | 获取已完成任务的文件树 |
-| `POST` | `/api/v1/simulations/{job_id}/feedback` | 提交文件反馈 |
+| `POST` | `/api/v1/simulations` | 创建新的仿真任务（支持 `pipeline_mode`、`checkpoints`、`llm_config` 等参数） |
+| `GET` | `/api/v1/simulations/{job_id}/files` | 获取已完成/失败/检查点任务的文件树 |
+| `POST` | `/api/v1/simulations/{job_id}/feedback` | 提交文件级反馈（同时保存到本地和云端） |
+| `PATCH` | `/api/v1/simulations/{job_id}/rating` | 提交任务级评价（1=成功, 2=部分成功, 3=失败） |
+| `DELETE` | `/api/v1/simulations/{job_id}` | 软删除任务（设置 `deleted_at` 时间戳，不可删除运行中的任务） |
+| `POST` | `/api/v1/simulations/{job_id}/cancel` | 取消排队中或运行中的任务（Worker 检测后终止子进程） |
+| `POST` | `/api/v1/simulations/{job_id}/stage/confirm` | 确认流水线检查点，允许流水线继续执行（受控模式） |
+| `POST` | `/api/v1/simulations/{job_id}/stage/reject` | 拒绝流水线检查点，将任务标记为失败（受控模式） |
+| `POST` | `/api/v1/simulations/{job_id}/restore` | 恢复已软删除的任务（清除 `deleted_at`） |
+| `GET` | `/api/v1/user/storage` | 获取当前用户的云端存储用量统计（5 分钟缓存） |
 
 ## 环境变量
 
@@ -113,20 +130,64 @@ pkill -f "uvicorn api_server:app"
 | `FOAM_AGENT_DIR` | 是 | Foam-Agent 仓库的绝对路径 |
 | `SUPABASE_URL` | 是 | Supabase 项目 URL |
 | `SUPABASE_SERVICE_KEY` | 是 | Supabase service_role key（绕过 RLS） |
-| `OPENAI_API_KEY` | 否 | 默认 OpenAI API key（用户未提供时使用） |
+| `SUPABASE_JWT_SECRET` | 是 | Supabase JWT 验证密钥（Dashboard → Settings → API → JWT Secret） |
+| `OPENAI_API_KEY` | 否 | 默认 OpenAI API key（用于 embedding 和用户未提供 key 时的回退） |
 | `WM_PROJECT_DIR` | 否 | OpenFOAM 安装路径（默认 `/opt/openfoam10`） |
 | `EXTRA_CORS_ORIGINS` | 否 | 额外的 CORS 来源（逗号分隔） |
+| `MIDDLEWARE_DIR` | 否 | cfdqanda-middleware 仓库路径（启用检查点预运行机制） |
+| `SIMULATION_TIMEOUT` | 否 | 仿真子进程超时（秒），默认 `3600`（1 小时） |
+| `STALE_JOB_THRESHOLD` | 否 | stale job 检测阈值（秒），默认 `7200`（2 小时）。启动时重置超过此阈值仍为 `running` 的任务 |
+| `MCP_SERVER_PORT` | 否 | MCP 服务端口，默认 `7860` |
 
 ## 工作流程
 
-1. 用户在前端提交仿真需求
+### 自动模式（默认）
+
+1. 用户在前端提交仿真需求（`pipeline_mode='auto'`）
 2. API 服务器向 Supabase `simulations` 表插入一行，状态为 `queued`
-3. Worker 每 10 秒轮询一次，拾取任务，将状态更新为 `running`
+3. Worker 每 2 秒轮询一次，通过 `claim_next_job()` RPC 原子性地认领任务（防止多 Worker 竞态），将状态更新为 `running`
 4. Worker 在 `Foam-Agent/runs/{job_id}/` 下写入 `prompt.txt`，然后以 `cwd=FOAM_AGENT_DIR` 启动 Foam-Agent 子进程
-5. 成功时：Worker 构建文件树、创建 ZIP 归档、上传所有文件到 Supabase Storage，设置状态为 `completed`
-6. 失败时：Worker 设置状态为 `failed` 并记录错误信息
-7. 前端通过 Supabase Realtime 实时接收状态更新
+5. 子进程执行期间，Worker 定时轮询数据库检测取消请求和超时
+6. 成功时：Worker 运行 Allrun 安全审计、构建文件树、创建 ZIP 归档、上传所有文件到 Supabase Storage，设置状态为 `completed`
+7. 失败时：Worker 上传已有文件（日志、部分输出），设置状态为 `failed` 并记录错误信息
+8. 前端通过 Supabase Realtime 实时接收状态更新
+
+### 受控流水线模式（MCP）
+
+当 `pipeline_mode='controlled'` 时，Worker 通过 MCP 协议分步调用 Foam-Agent：
+
+```
+plan() → [plan_review 检查点] → input_writer() → [files_review 检查点]
+→ pre-run（10 步 + 纠错循环）→ [pre_run_review 检查点] → full run() → completed
+```
+
+- 每个检查点由用户通过前端确认（`stage/confirm`）或拒绝（`stage/reject`）
+- 检查点是可选的，通过提交任务时的 `checkpoints` 参数指定启用哪些
+- 预运行阶段包含自动纠错循环（最多 3 次）：失败 → MCP `review()` + `apply_fixes()` → 重试
+- 完整运行不含纠错循环（配置已在预运行阶段验证通过）
+
+### 数据生命周期
+
+Worker 内置自动清理机制（每小时检查一次）：
+
+| 类型 | 保留天数 | 动作 |
+|------|---------|------|
+| 失败/取消的任务 | 7 天 | 自动软删除（设置 `deleted_at`） |
+| 已完成的任务 | 14 天 | 自动软删除 |
+| 已软删除的任务 | 3 天 | 硬删除（清理 Supabase Storage 文件 → 本地 `runs/` 目录 → 数据库行） |
 
 ### BYOK（自带密钥）
 
-用户可以在提交任务时选择自己的 LLM 配置（提供商、模型版本、API key）。Worker 将这些配置作为环境变量注入 Foam-Agent 子进程，并在读取后**立即从数据库中删除** API key，保护用户隐私。
+用户可以在提交任务时选择自己的 LLM 配置（提供商、模型版本、API key 或 Codex OAuth token）。Worker 将这些配置作为环境变量注入 Foam-Agent 子进程，并在读取后**立即从数据库中删除**敏感令牌，保护用户隐私。
+
+支持的认证方式：
+- **API Key**：适用于 `openai`、`anthropic` 等标准提供商
+- **Codex OAuth Token**：适用于 `openai-codex` 提供商（写入临时 `auth.json`，运行结束后自动清理）
+
+## 测试
+
+```bash
+cd cfdqanda-server
+conda activate foam-api
+pytest tests/
+```
