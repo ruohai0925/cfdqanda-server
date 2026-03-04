@@ -1130,6 +1130,7 @@ def find_and_process_job():
     # Read user LLM config and build subprocess environment
     llm_config = job.get('llm_config') or {}
     child_env = os.environ.copy()
+    temp_codex_dir = None  # Track temp dir for cleanup
 
     # Inject user-provided API key
     user_api_key = llm_config.get('api_key')
@@ -1141,15 +1142,30 @@ def find_and_process_job():
             child_env['OPENAI_API_KEY'] = user_api_key
         logger.info(f"Job {job_id}: using user-provided API key for provider={provider}")
 
-        # Immediately clear api_key from DB (privacy)
+    # Inject user-provided Codex OAuth token
+    codex_token = llm_config.get('codex_token')
+    if codex_token:
+        # Write token to a temp auth.json and set CODEX_HOME so
+        # Foam-Agent's _load_codex_oauth() finds it automatically
+        temp_codex_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id), ".codex_auth")
+        os.makedirs(temp_codex_dir, exist_ok=True)
+        auth_json_path = os.path.join(temp_codex_dir, "auth.json")
+        with open(auth_json_path, "w") as f:
+            json.dump({"access_token": codex_token}, f)
+        child_env['CODEX_HOME'] = temp_codex_dir
+        logger.info(f"Job {job_id}: wrote Codex OAuth token to {auth_json_path}")
+
+    # Immediately clear sensitive tokens from DB (privacy)
+    sensitive_keys = {'api_key', 'codex_token'}
+    if any(llm_config.get(k) for k in sensitive_keys):
         try:
-            safe_config = {k: v for k, v in llm_config.items() if k != 'api_key'}
+            safe_config = {k: v for k, v in llm_config.items() if k not in sensitive_keys}
             supabase.table('simulations').update(
                 {'llm_config': safe_config if safe_config else None}
             ).eq('id', job_id).execute()
-            logger.info(f"Job {job_id}: cleared api_key from database")
+            logger.info(f"Job {job_id}: cleared sensitive tokens from database")
         except Exception as e:
-            logger.warning(f"Job {job_id}: failed to clear api_key from DB: {e}")
+            logger.warning(f"Job {job_id}: failed to clear tokens from DB: {e}")
 
     # Prepare run directory and files
     run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
@@ -1163,28 +1179,21 @@ def find_and_process_job():
     log_path = os.path.join(run_dir, "simulation.log")
 
     try:
-        # Patch Config defaults and run Foam-Agent
+        # Set env vars for Foam-Agent's Config.__post_init__() to read natively
         effective_provider = llm_config.get('model_provider') or 'openai-codex'
         effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
-        child_env['FOAM_MODEL_PROVIDER'] = effective_provider
-        child_env['FOAM_MODEL_VERSION'] = effective_version
+        child_env['FOAMAGENT_MODEL_PROVIDER'] = effective_provider
+        child_env['FOAMAGENT_MODEL_VERSION'] = effective_version
         child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
         child_env['FOAM_PROMPT_PATH'] = os.path.abspath(prompt_path)
         logger.info(f"Job {job_id}: using provider={effective_provider}, model={effective_version}")
 
+        # Config.__post_init__() reads FOAMAGENT_MODEL_PROVIDER/VERSION natively,
+        # so no need for the inspect-based patching hack anymore.
         command = [
             "python", "-c",
-            "import os,sys,inspect; sys.path.insert(0,'src'); "
-            "from config import Config; "
-            "params=list(inspect.signature(Config.__init__).parameters.keys()); "
-            "params.remove('self'); "
-            "defaults=list(Config.__init__.__defaults__); "
-            "p=os.environ.get('FOAM_MODEL_PROVIDER'); "
-            "v=os.environ.get('FOAM_MODEL_VERSION'); "
-            "p and defaults.__setitem__(params.index('model_provider'),p); "
-            "v and defaults.__setitem__(params.index('model_version'),v); "
-            "Config.__init__.__defaults__=tuple(defaults); "
-            "from main import main; "
+            "import os,sys; sys.path.insert(0,'src'); "
+            "from config import Config; from main import main; "
             "c=Config(); c.case_dir=os.environ['FOAM_OUTPUT_DIR']; "
             "main(open(os.environ['FOAM_PROMPT_PATH']).read(),c)"
         ]
@@ -1231,6 +1240,15 @@ def find_and_process_job():
             'status': 'failed',
             'result_data': {'error': f"Worker script encountered an exception: {str(e)}"}
         }).eq('id', job_id).execute()
+
+    finally:
+        # Clean up temp Codex auth directory (contains OAuth token)
+        if temp_codex_dir and os.path.isdir(temp_codex_dir):
+            try:
+                shutil.rmtree(temp_codex_dir)
+                logger.info(f"Job {job_id}: cleaned up temp Codex auth dir")
+            except Exception as e:
+                logger.warning(f"Job {job_id}: failed to clean up Codex auth dir: {e}")
 
     return True
 
