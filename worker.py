@@ -523,27 +523,21 @@ def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout):
     return process.returncode, cancelled, timed_out
 
 
-def _handle_cancelled_or_timeout(job_id, log_path, cancelled, timed_out):
+def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path, cancelled, timed_out):
     """Update DB for cancelled or timed-out jobs. Returns True if handled."""
     if cancelled:
         logger.info(f"Job {job_id} was cancelled by user. Subprocess terminated.")
-        supabase.table('simulations').update({
-            'status': 'cancelled',
-            'result_data': {
-                'error': 'Simulation cancelled by user.',
-                'log_path_on_server': log_path,
-            }
-        }).eq('id', job_id).execute()
+        _upload_and_fail(job_id, user_id, 'Simulation cancelled by user.',
+                         run_dir=run_dir,
+                         extra_result={'log_path_on_server': log_path})
+        # Override status to 'cancelled' (not 'failed')
+        supabase.table('simulations').update({'status': 'cancelled'}).eq('id', job_id).execute()
         return True
 
     if timed_out:
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {
-                'error': f"Simulation timed out.",
-                'log_path_on_server': log_path,
-            }
-        }).eq('id', job_id).execute()
+        _upload_and_fail(job_id, user_id, 'Simulation timed out.',
+                         run_dir=run_dir,
+                         extra_result={'log_path_on_server': log_path})
         return True
 
     return False
@@ -571,6 +565,52 @@ def _run_allrun_audit(run_dir, job_id):
                 f"({allrun_audit['files_scanned']} file(s) scanned)"
             )
     return allrun_audit
+
+
+def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None,
+                     extra_fields=None):
+    """Upload whatever files exist to Supabase Storage, then mark job as failed.
+
+    This ensures failed tasks also have their files (logs, partial output)
+    available in cloud storage for user browsing and storage accounting.
+
+    Args:
+        job_id: Simulation task ID.
+        user_id: Owner user ID (needed for storage path).
+        error_msg: Error description string.
+        run_dir: Local run directory. If None or missing, skip upload.
+        extra_result: Additional dict entries to merge into result_data.
+        extra_fields: Additional DB columns to set (e.g. pipeline_stage).
+    """
+    result_data = {'error': error_msg}
+    if extra_result:
+        result_data.update(extra_result)
+
+    # Upload files if run_dir exists and has content
+    if run_dir and os.path.isdir(run_dir) and os.listdir(run_dir):
+        storage_base_path = f"public/{user_id}/{job_id}"
+        try:
+            file_tree = build_file_tree(run_dir)
+            uploaded_count, failed_count, total_bytes = upload_directory_to_storage(
+                run_dir, storage_base_path, supabase
+            )
+            result_data['storage_base_path'] = storage_base_path
+            result_data['file_tree'] = file_tree
+            result_data['upload_stats'] = {
+                'uploaded': uploaded_count,
+                'failed': failed_count,
+                'total_bytes': total_bytes,
+            }
+            logger.info(f"Job {job_id} (failed): uploaded {uploaded_count} files "
+                        f"({total_bytes} bytes) to storage before marking failed")
+        except Exception as e:
+            logger.warning(f"Job {job_id}: failed to upload files on failure: {e}")
+
+    update_data = {'status': 'failed', 'result_data': result_data}
+    if extra_fields:
+        update_data.update(extra_fields)
+
+    supabase.table('simulations').update(update_data).eq('id', job_id).execute()
 
 
 def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun_audit,
@@ -807,18 +847,18 @@ def _handle_controlled_pipeline(job):
             asyncio.run(_mcp_stage_full_run(job, pipeline_state))
         else:
             logger.error(f"Job {job_id}: unknown pipeline_stage '{pipeline_stage}'")
-            supabase.table('simulations').update({
-                'status': 'failed',
-                'result_data': {'error': f"Unknown pipeline_stage: {pipeline_stage}"},
-            }).eq('id', job_id).execute()
+            run_dir = pipeline_state.get('case_dir') or os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
+            _upload_and_fail(job_id, job['user_id'],
+                             f"Unknown pipeline_stage: {pipeline_stage}",
+                             run_dir=run_dir)
 
     except Exception as e:
         logger.error(f"Job {job_id}: controlled pipeline error: {e}", exc_info=True)
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'pipeline_stage': pipeline_stage,
-            'result_data': {'error': f"Pipeline error at stage '{pipeline_stage}': {str(e)}"},
-        }).eq('id', job_id).execute()
+        run_dir = pipeline_state.get('case_dir') or os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
+        _upload_and_fail(job_id, job['user_id'],
+                         f"Pipeline error at stage '{pipeline_stage}': {str(e)}",
+                         run_dir=run_dir,
+                         extra_fields={'pipeline_stage': pipeline_stage})
 
 
 async def _mcp_stage_plan(job, pipeline_state, active_checkpoints):
@@ -1020,14 +1060,13 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
         _append_mcp_log(job_id, 'pre_run',
                         f'Pre-run FAILED after {pre_run_fix_count} fix attempts')
         logger.error(f"Job {job_id}: pre-run failed after {pre_run_fix_count} fix attempts")
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'pipeline_stage': 'pre_running',
-            'result_data': {
-                'error': f'Pre-run simulation failed after {pre_run_fix_count} fix attempts.',
-                'checkpoint_data': checkpoint_data,
-            },
-        }).eq('id', job_id).execute()
+        _upload_and_fail(
+            job_id, job['user_id'],
+            f'Pre-run simulation failed after {pre_run_fix_count} fix attempts.',
+            run_dir=case_dir or os.path.join(FOAM_AGENT_DIR, "runs", str(job_id)),
+            extra_result={'checkpoint_data': checkpoint_data},
+            extra_fields={'pipeline_stage': 'pre_running'},
+        )
         return
 
     pipeline_state['checkpoint_data'] = checkpoint_data
@@ -1122,11 +1161,12 @@ async def _mcp_stage_full_run(job, pipeline_state):
             logger.info(f"Job {job_id}: restored endTime={original_end_time} for full run")
         except Exception as e:
             logger.error(f"Job {job_id}: failed to prepare normal-run: {e}", exc_info=True)
-            supabase.table('simulations').update({
-                'status': 'failed',
-                'pipeline_stage': 'running',
-                'result_data': {'error': f'Normal-run preparation failed: {str(e)}'},
-            }).eq('id', job_id).execute()
+            _upload_and_fail(
+                job_id, job['user_id'],
+                f'Normal-run preparation failed: {str(e)}',
+                run_dir=case_dir or os.path.join(FOAM_AGENT_DIR, "runs", str(job_id)),
+                extra_fields={'pipeline_stage': 'running'},
+            )
             return
 
     _update_pipeline_state(job_id, 'running', 'running', pipeline_state)
@@ -1286,7 +1326,7 @@ def find_and_process_job():
             timeout=SIMULATION_TIMEOUT,
         )
 
-        if _handle_cancelled_or_timeout(job_id, log_path, cancelled, timed_out):
+        if _handle_cancelled_or_timeout(job_id, job['user_id'], run_dir, log_path, cancelled, timed_out):
             return True
 
         # Post-execution Allrun security audit
@@ -1300,21 +1340,20 @@ def find_and_process_job():
             )
         else:
             logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
-            supabase.table('simulations').update({
-                'status': 'failed',
-                'result_data': {
-                    'error': f"Foam-Agent script failed with return code {returncode}.",
-                    'log_path_on_server': log_path,
-                    'allrun_audit': allrun_audit,
-                }
-            }).eq('id', job_id).execute()
+            _upload_and_fail(
+                job_id, job['user_id'],
+                f"Foam-Agent script failed with return code {returncode}.",
+                run_dir=run_dir,
+                extra_result={'log_path_on_server': log_path, 'allrun_audit': allrun_audit},
+            )
 
     except Exception as e:
         logger.error(f"A critical error occurred while processing job {job_id}: {e}", exc_info=True)
-        supabase.table('simulations').update({
-            'status': 'failed',
-            'result_data': {'error': f"Worker script encountered an exception: {str(e)}"}
-        }).eq('id', job_id).execute()
+        _upload_and_fail(
+            job_id, job['user_id'],
+            f"Worker script encountered an exception: {str(e)}",
+            run_dir=run_dir,
+        )
 
     finally:
         # Clean up temp Codex auth directory (contains OAuth token)
