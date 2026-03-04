@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone
 import logging
+import time
 import jwt
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -605,6 +606,11 @@ def _get_storage_dir_size(prefix: str) -> int:
     return total
 
 
+# In-memory cache: { user_id: { "result": {...}, "expires": timestamp } }
+_storage_cache = {}
+_STORAGE_CACHE_TTL = 300  # 5 minutes
+
+
 @app.get("/api/v1/user/storage")
 @limiter.limit("10/minute")
 async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt)):
@@ -612,7 +618,13 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
     Return storage usage summary for the authenticated user.
     Uses pre-recorded total_bytes when available, falls back to
     querying Supabase Storage metadata for historical tasks.
+    Results cached for 5 minutes to avoid flooding Supabase Storage API.
     """
+    # Check cache first
+    cached = _storage_cache.get(user_id)
+    if cached and time.time() < cached["expires"]:
+        return cached["result"]
+
     try:
         response = (
             supabase.table('simulations')
@@ -643,12 +655,16 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
                 if storage_base:
                     total_bytes += _get_storage_dir_size(storage_base)
 
-        return {
+        result = {
             "total_bytes": total_bytes,
             "total_display": _format_bytes(total_bytes),
             "task_count": task_count,
             "breakdown": breakdown,
         }
+
+        # Cache the result
+        _storage_cache[user_id] = {"result": result, "expires": time.time() + _STORAGE_CACHE_TTL}
+        return result
 
     except Exception as e:
         logger.error(f"Error in get_user_storage: {e}", exc_info=True)
