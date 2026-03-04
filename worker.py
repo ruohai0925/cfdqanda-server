@@ -606,6 +606,15 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
         except Exception as e:
             logger.warning(f"Job {job_id}: failed to upload files on failure: {e}")
 
+    # Preserve accumulated stage feedback before clearing pipeline_state
+    try:
+        ps_resp = supabase.table('simulations').select('pipeline_state').eq('id', job_id).execute()
+        ps = (ps_resp.data[0].get('pipeline_state') or {}) if ps_resp.data else {}
+        if ps.get('stage_feedback'):
+            result_data['stage_feedback'] = ps['stage_feedback']
+    except Exception as e:
+        logger.warning(f"Job {job_id}: failed to read pipeline_state for stage_feedback: {e}")
+
     update_data = {'status': 'failed', 'result_data': result_data}
     if extra_fields:
         update_data.update(extra_fields)
@@ -671,6 +680,15 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
     }
     if token_usage:
         final_result["token_usage"] = token_usage
+
+    # Preserve accumulated stage feedback before clearing pipeline_state
+    try:
+        ps_resp = supabase.table('simulations').select('pipeline_state').eq('id', job_id).execute()
+        ps = (ps_resp.data[0].get('pipeline_state') or {}) if ps_resp.data else {}
+        if ps.get('stage_feedback'):
+            final_result['stage_feedback'] = ps['stage_feedback']
+    except Exception as e:
+        logger.warning(f"Job {job_id}: failed to read pipeline_state for stage_feedback: {e}")
 
     supabase.table('simulations').update({
         'status': 'completed',

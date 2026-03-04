@@ -458,10 +458,17 @@ async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(ve
     """
     User confirms current pipeline stage, allowing the pipeline to advance.
     Only used by controlled pipeline mode. Re-queues the job so Worker picks it up.
+    Accepts optional comment to record user feedback for the stage.
     """
     try:
+        body = await request.json() if request.headers.get('content-type', '').startswith('application/json') else {}
+    except Exception:
+        body = {}
+    comment = (body.get('comment') or '').strip()
+
+    try:
         response = supabase.table('simulations').select(
-            'id, user_id, status, pipeline_stage'
+            'id, user_id, status, pipeline_stage, pipeline_state'
         ).eq('id', job_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
@@ -476,14 +483,25 @@ async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(ve
             )
 
         pipeline_stage = job.get('pipeline_stage')
+        pipeline_state = job.get('pipeline_state') or {}
+
+        # Append stage feedback (accumulative, never overwritten)
+        stage_feedback = pipeline_state.setdefault('stage_feedback', [])
+        stage_feedback.append({
+            'stage': pipeline_stage,
+            'action': 'confirm',
+            'comment': comment,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
 
         # Keep pipeline_stage as-is so Worker knows which stage was confirmed
         # and routes to the next one
         supabase.table('simulations').update({
             'status': 'queued',
+            'pipeline_state': pipeline_state,
         }).eq('id', job_id).execute()
 
-        logger.info(f"Stage confirmed for job {job_id} (stage={pipeline_stage})")
+        logger.info(f"Stage confirmed for job {job_id} (stage={pipeline_stage}, comment={'yes' if comment else 'none'})")
         return {"status": "success", "message": f"Stage '{pipeline_stage}' confirmed. Pipeline will continue."}
 
     except HTTPException:
@@ -498,8 +516,14 @@ async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(ve
 async def reject_stage(request: Request, job_id: str, user_id: str = Depends(verify_jwt)):
     """
     User rejects current pipeline stage. Marks the simulation as failed.
-    Used by controlled pipeline mode. Preserves result_data for reference.
+    Used by controlled pipeline mode. Preserves result_data and stage feedback.
     """
+    try:
+        body = await request.json() if request.headers.get('content-type', '').startswith('application/json') else {}
+    except Exception:
+        body = {}
+    comment = (body.get('comment') or '').strip()
+
     try:
         response = supabase.table('simulations').select(
             'id, user_id, status, pipeline_mode, pipeline_stage, pipeline_state, result_data'
@@ -517,15 +541,29 @@ async def reject_stage(request: Request, job_id: str, user_id: str = Depends(ver
             )
 
         pipeline_stage = job.get('pipeline_stage')
+        pipeline_state = job.get('pipeline_state') or {}
+
+        # Append stage feedback (accumulative, never overwritten)
+        stage_feedback = pipeline_state.setdefault('stage_feedback', [])
+        stage_feedback.append({
+            'stage': pipeline_stage,
+            'action': 'reject',
+            'comment': comment,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
+
         existing_result = job.get('result_data') or {}
         existing_result['rejected_stage'] = pipeline_stage
+        # Persist all stage feedback into result_data (pipeline_state may be cleared)
+        existing_result['stage_feedback'] = stage_feedback
 
         supabase.table('simulations').update({
             'status': 'failed',
+            'pipeline_state': pipeline_state,
             'result_data': existing_result,
         }).eq('id', job_id).execute()
 
-        logger.info(f"Stage '{pipeline_stage}' rejected for job {job_id}. Marked as failed.")
+        logger.info(f"Stage '{pipeline_stage}' rejected for job {job_id} (comment={'yes' if comment else 'none'}). Marked as failed.")
         return {"status": "success", "message": f"Stage '{pipeline_stage}' rejected. Simulation marked as failed."}
 
     except HTTPException:
