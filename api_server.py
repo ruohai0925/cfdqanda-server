@@ -581,12 +581,37 @@ def _format_bytes(size_bytes: int) -> str:
     return f"{size:.1f} {units[i]}" if i > 0 else f"{int(size)} B"
 
 
+def _get_storage_dir_size(prefix: str) -> int:
+    """
+    Recursively sum file sizes under a Supabase Storage prefix.
+    Used as fallback when upload_stats.total_bytes is not available.
+    """
+    total = 0
+    try:
+        listed = supabase.storage.from_('simulation_results').list(prefix)
+        if not listed:
+            return 0
+        for item in listed:
+            item_path = f"{prefix}/{item['name']}"
+            if item.get('id') is None:
+                # Directory — recurse
+                total += _get_storage_dir_size(item_path)
+            else:
+                # File — metadata includes size in bytes
+                meta = item.get('metadata') or {}
+                total += meta.get('size', 0)
+    except Exception:
+        pass
+    return total
+
+
 @app.get("/api/v1/user/storage")
 @limiter.limit("10/minute")
 async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt)):
     """
     Return storage usage summary for the authenticated user.
-    Aggregates total_bytes from result_data.upload_stats across all non-deleted simulations.
+    Uses pre-recorded total_bytes when available, falls back to
+    querying Supabase Storage metadata for historical tasks.
     """
     try:
         response = (
@@ -604,9 +629,19 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
         for row in response.data:
             status = row.get('status', 'unknown')
             breakdown[status] = breakdown.get(status, 0) + 1
+
             rd = row.get('result_data') or {}
             stats = rd.get('upload_stats') or {}
-            total_bytes += stats.get('total_bytes', 0)
+            recorded = stats.get('total_bytes')
+
+            if recorded is not None and recorded > 0:
+                # New tasks: use pre-recorded value (fast)
+                total_bytes += recorded
+            else:
+                # Historical tasks: query Storage metadata (fallback)
+                storage_base = rd.get('storage_base_path')
+                if storage_base:
+                    total_bytes += _get_storage_dir_size(storage_base)
 
         return {
             "total_bytes": total_bytes,
