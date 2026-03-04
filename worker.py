@@ -192,15 +192,16 @@ def upload_directory_to_storage(local_dir, storage_base_path, supabase_client):
         supabase_client: Supabase客户端实例
 
     返回:
-        (uploaded_count, failed_count): 成功和失败的文件数量
+        (uploaded_count, failed_count, total_bytes): 成功/失败的文件数量和总字节数
     """
     uploaded_count = 0
     failed_count = 0
+    total_bytes = 0
 
     base_path = Path(local_dir)
     if not base_path.exists():
         logger.error(f"Local directory {local_dir} does not exist")
-        return uploaded_count, failed_count
+        return uploaded_count, failed_count, total_bytes
 
     # 遍历所有文件
     for root, dirs, files in os.walk(local_dir):
@@ -215,6 +216,7 @@ def upload_directory_to_storage(local_dir, storage_base_path, supabase_client):
                 # 读取文件内容
                 with open(local_file_path, 'rb') as f:
                     file_content = f.read()
+                total_bytes += len(file_content)
 
                 # 获取文件类型
                 _, ext = os.path.splitext(file)
@@ -245,8 +247,8 @@ def upload_directory_to_storage(local_dir, storage_base_path, supabase_client):
                 logger.error(f"Failed to upload file {local_file_path} to {storage_file_path}: {e}")
                 # 继续上传其他文件，不因单个文件失败而中断
 
-    logger.info(f"Upload complete: {uploaded_count} files uploaded, {failed_count} files failed")
-    return uploaded_count, failed_count
+    logger.info(f"Upload complete: {uploaded_count} files uploaded, {failed_count} files failed, {total_bytes} bytes total")
+    return uploaded_count, failed_count, total_bytes
 
 
 # --- 3. Stale job recovery ---
@@ -294,19 +296,22 @@ def recover_stale_jobs():
         logger.error(f"Error during stale job recovery: {e}", exc_info=True)
 
 
-# --- 4. Purge soft-deleted simulations ---
+# --- 4. Purge & TTL auto-expiry ---
 
 # Throttle: run at most once per hour
 _last_purge_time = 0.0
 PURGE_INTERVAL = 3600       # seconds between purge runs
-PURGE_RETENTION_DAYS = 3    # keep soft-deleted rows for 3 days
+PURGE_RETENTION_DAYS = 3    # keep soft-deleted rows for 3 days before hard-delete
+TTL_FAILED_DAYS = 7         # auto-expire failed/cancelled tasks after 7 days
+TTL_COMPLETED_DAYS = 14     # auto-expire completed tasks after 14 days
 
 
-def purge_deleted_simulations():
+def run_purge_cycle():
     """
-    Hard-delete simulations where deleted_at is older than PURGE_RETENTION_DAYS.
-    Cleanup order: Supabase Storage files -> local runs/ directory -> DB row.
-    Throttled to run at most once per PURGE_INTERVAL seconds.
+    Single throttled entry point for all purge/TTL work.
+    Runs at most once per PURGE_INTERVAL seconds.
+    1. Auto-expire old tasks (soft-delete via TTL)
+    2. Hard-delete tasks whose deleted_at is older than PURGE_RETENTION_DAYS
     """
     global _last_purge_time
     now = time.time()
@@ -314,6 +319,78 @@ def purge_deleted_simulations():
         return
     _last_purge_time = now
 
+    _purge_expired_simulations()
+    _purge_deleted_simulations()
+
+
+def _purge_expired_simulations():
+    """
+    Auto-expire old simulations by setting deleted_at (soft-delete).
+    - failed/cancelled tasks older than TTL_FAILED_DAYS (7 days)
+    - completed tasks older than TTL_COMPLETED_DAYS (14 days)
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    try:
+        # 1. Auto-expire failed/cancelled > TTL_FAILED_DAYS
+        failed_cutoff = (now_utc - timedelta(days=TTL_FAILED_DAYS)).isoformat()
+        resp1 = (
+            supabase.table('simulations')
+            .update({'deleted_at': now_utc.isoformat()})
+            .is_('deleted_at', 'null')
+            .in_('status', ['failed', 'cancelled'])
+            .lt('created_at', failed_cutoff)
+            .execute()
+        )
+        expired_failed = len(resp1.data) if resp1.data else 0
+
+        # 2. Auto-expire completed > TTL_COMPLETED_DAYS
+        completed_cutoff = (now_utc - timedelta(days=TTL_COMPLETED_DAYS)).isoformat()
+        resp2 = (
+            supabase.table('simulations')
+            .update({'deleted_at': now_utc.isoformat()})
+            .is_('deleted_at', 'null')
+            .eq('status', 'completed')
+            .lt('created_at', completed_cutoff)
+            .execute()
+        )
+        expired_completed = len(resp2.data) if resp2.data else 0
+
+        if expired_failed or expired_completed:
+            logger.info(f"TTL auto-expire: {expired_failed} failed/cancelled, {expired_completed} completed tasks marked for deletion")
+
+    except Exception as e:
+        logger.error(f"TTL auto-expire: error: {e}", exc_info=True)
+
+
+def _remove_storage_directory(prefix):
+    """
+    Recursively list and remove all files under a Supabase Storage prefix.
+    Supabase list() only returns one level, so we must recurse into subdirectories.
+    """
+    bucket = supabase.storage.from_('simulation_results')
+    listed = bucket.list(prefix)
+    if not listed:
+        return
+
+    files = []
+    for item in listed:
+        item_path = f"{prefix}/{item['name']}"
+        if item.get('id') is None:
+            # Directory entry (no id) — recurse
+            _remove_storage_directory(item_path)
+        else:
+            files.append(item_path)
+
+    if files:
+        bucket.remove(files)
+
+
+def _purge_deleted_simulations():
+    """
+    Hard-delete simulations where deleted_at is older than PURGE_RETENTION_DAYS.
+    Cleanup order: Supabase Storage files -> local runs/ directory -> DB row.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=PURGE_RETENTION_DAYS)).isoformat()
     try:
         response = (
@@ -335,15 +412,11 @@ def purge_deleted_simulations():
             user_id = row.get('user_id')
             result_data = row.get('result_data') or {}
 
-            # 1. Delete files from Supabase Storage
+            # 1. Delete files from Supabase Storage (recursive)
             storage_base = result_data.get('storage_base_path')
             if storage_base:
                 try:
-                    # List all files under the storage path and remove them
-                    listed = supabase.storage.from_('simulation_results').list(storage_base)
-                    if listed:
-                        paths = [f"{storage_base}/{f['name']}" for f in listed]
-                        supabase.storage.from_('simulation_results').remove(paths)
+                    _remove_storage_directory(storage_base)
                     logger.info(f"Purge: removed Storage files for job {job_id}")
                 except Exception as e:
                     logger.warning(f"Purge: failed to remove Storage files for job {job_id}: {e}")
@@ -366,6 +439,7 @@ def purge_deleted_simulations():
 
     except Exception as e:
         logger.error(f"Purge: error during purge cycle: {e}", exc_info=True)
+
 
 
 # --- 5. Cancellation helpers ---
@@ -530,7 +604,7 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
         logger.error(f"Failed to upload ZIP file: {e}")
 
     logger.info(f"Uploading all files from {upload_dir} to Storage...")
-    uploaded_count, failed_count = upload_directory_to_storage(
+    uploaded_count, failed_count, total_bytes = upload_directory_to_storage(
         upload_dir,
         storage_base_path,
         supabase
@@ -550,7 +624,8 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
         "file_tree": file_tree,
         "upload_stats": {
             "uploaded": uploaded_count,
-            "failed": failed_count
+            "failed": failed_count,
+            "total_bytes": total_bytes
         },
         "allrun_audit": allrun_audit,
     }
@@ -843,7 +918,7 @@ async def _mcp_stage_input_writer(job, pipeline_state, active_checkpoints):
         storage_base_path = f"public/{job['user_id']}/{job_id}"
         upload_src = case_dir if case_dir else run_dir
         file_tree = build_file_tree(upload_src)
-        uploaded_count, failed_count = upload_directory_to_storage(
+        uploaded_count, failed_count, total_bytes = upload_directory_to_storage(
             upload_src, storage_base_path, supabase
         )
         _update_pipeline_state(job_id, 'files_review', 'checkpoint', pipeline_state,
@@ -851,7 +926,7 @@ async def _mcp_stage_input_writer(job, pipeline_state, active_checkpoints):
                                    'result_data': {
                                        'storage_base_path': storage_base_path,
                                        'file_tree': file_tree,
-                                       'upload_stats': {'uploaded': uploaded_count, 'failed': failed_count},
+                                       'upload_stats': {'uploaded': uploaded_count, 'failed': failed_count, 'total_bytes': total_bytes},
                                    }
                                })
         logger.info(f"Job {job_id}: paused at files_review checkpoint ({uploaded_count} files uploaded)")
@@ -1008,7 +1083,7 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
         storage_base_path = f"public/{job['user_id']}/{job_id}"
         upload_src = case_dir if case_dir else run_dir
         file_tree = build_file_tree(upload_src)
-        uploaded_count, failed_count = upload_directory_to_storage(
+        uploaded_count, failed_count, total_bytes = upload_directory_to_storage(
             upload_src, storage_base_path, supabase
         )
         _update_pipeline_state(job_id, 'pre_run_review', 'checkpoint', pipeline_state,
@@ -1018,7 +1093,7 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
                                        'checkpoint_phase': 'pre-run',
                                        'storage_base_path': storage_base_path,
                                        'file_tree': file_tree,
-                                       'upload_stats': {'uploaded': uploaded_count, 'failed': failed_count},
+                                       'upload_stats': {'uploaded': uploaded_count, 'failed': failed_count, 'total_bytes': total_bytes},
                                    }
                                })
         logger.info(f"Job {job_id}: paused at pre_run_review checkpoint")
@@ -1265,8 +1340,8 @@ def main_loop():
     logger.info("Worker started. Looking for jobs...")
     while True:
         try:
-            # Purge expired soft-deleted simulations (throttled internally)
-            purge_deleted_simulations()
+            # Purge cycle: auto-expire old tasks + hard-delete expired soft-deleted (throttled internally)
+            run_purge_cycle()
 
             processed_a_job = find_and_process_job()
             if not processed_a_job:

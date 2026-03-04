@@ -564,3 +564,57 @@ async def restore_simulation(job_id: str, user_id: str = Depends(verify_jwt)):
     except Exception as e:
         logger.error(f"Error in restore_simulation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 10. Storage usage endpoint ---
+
+def _format_bytes(size_bytes: int) -> str:
+    """Format bytes into human-readable string."""
+    if size_bytes == 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    size = float(size_bytes)
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024
+        i += 1
+    return f"{size:.1f} {units[i]}" if i > 0 else f"{int(size)} B"
+
+
+@app.get("/api/v1/user/storage")
+@limiter.limit("10/minute")
+async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt)):
+    """
+    Return storage usage summary for the authenticated user.
+    Aggregates total_bytes from result_data.upload_stats across all non-deleted simulations.
+    """
+    try:
+        response = (
+            supabase.table('simulations')
+            .select('id, status, result_data, created_at')
+            .eq('user_id', user_id)
+            .is_('deleted_at', 'null')
+            .execute()
+        )
+
+        total_bytes = 0
+        task_count = len(response.data)
+        breakdown = {}
+
+        for row in response.data:
+            status = row.get('status', 'unknown')
+            breakdown[status] = breakdown.get(status, 0) + 1
+            rd = row.get('result_data') or {}
+            stats = rd.get('upload_stats') or {}
+            total_bytes += stats.get('total_bytes', 0)
+
+        return {
+            "total_bytes": total_bytes,
+            "total_display": _format_bytes(total_bytes),
+            "task_count": task_count,
+            "breakdown": breakdown,
+        }
+
+    except Exception as e:
+        logger.error(f"Error in get_user_storage: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
