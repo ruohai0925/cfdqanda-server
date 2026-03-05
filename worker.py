@@ -107,8 +107,14 @@ def build_file_tree(directory_path):
         logger.warning(f"Directory {directory_path} does not exist")
         return file_tree
 
+    # Directories to exclude from file tree (sensitive or ephemeral)
+    excluded_dirs = {'.codex_auth'}
+
     # 使用os.walk遍历所有文件和目录
     for root, dirs, files in os.walk(directory_path):
+        # Skip excluded directories (modifying dirs in-place prunes os.walk)
+        dirs[:] = [d for d in dirs if d not in excluded_dirs]
+
         # 计算相对于base_path的路径
         rel_root = os.path.relpath(root, directory_path)
 
@@ -203,8 +209,14 @@ def upload_directory_to_storage(local_dir, storage_base_path, supabase_client):
         logger.error(f"Local directory {local_dir} does not exist")
         return uploaded_count, failed_count, total_bytes
 
+    # Directories to exclude from upload (sensitive or ephemeral)
+    excluded_dirs = {'.codex_auth'}
+
     # 遍历所有文件
     for root, dirs, files in os.walk(local_dir):
+        # Skip excluded directories (modifying dirs in-place prunes os.walk)
+        dirs[:] = [d for d in dirs if d not in excluded_dirs]
+
         for file in files:
             local_file_path = os.path.join(root, file)
 
