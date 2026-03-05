@@ -19,6 +19,11 @@ FROM leoyue123/foamagent:latest
 # --- Install Worker-specific dependencies into the FoamAgent conda env ---
 # The base image's conda env does not include supabase or python-dotenv.
 # Use the conda env's pip directly (entrypoint is not active during build).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git-lfs \
+    && git lfs install \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN /opt/conda/envs/FoamAgent/bin/pip install --no-cache-dir \
     supabase python-dotenv langchain-huggingface sentence-transformers \
     --upgrade faiss-cpu
@@ -42,4 +47,4 @@ COPY mcp_client.py .
 #   2. conda activate FoamAgent           (Python 3.12 + all ML/CFD deps)
 #   3. exec "$@"                          (runs our CMD below)
 
-CMD ["python", "-u", "/app/worker/worker.py"]
+CMD ["bash", "-c", "cd /home/openfoam/Foam-Agent && git lfs pull && exec python -u /app/worker/worker.py"]
