@@ -47,4 +47,4 @@ COPY mcp_client.py .
 #   2. conda activate FoamAgent           (Python 3.12 + all ML/CFD deps)
 #   3. exec "$@"                          (runs our CMD below)
 
-CMD ["bash", "-c", "cd /home/openfoam/Foam-Agent && git lfs pull && exec python -u /app/worker/worker.py"]
+CMD ["sh", "-c", "git config --global --add safe.directory /home/openfoam/Foam-Agent && cd /home/openfoam/Foam-Agent && git lfs pull && exec python -u /app/worker/worker.py"]
