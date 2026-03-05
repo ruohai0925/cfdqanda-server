@@ -20,7 +20,7 @@ FROM leoyue123/foamagent:latest
 # The base image's conda env does not include supabase or python-dotenv.
 # Use the conda env's pip directly (entrypoint is not active during build).
 RUN /opt/conda/envs/FoamAgent/bin/pip install --no-cache-dir \
-    supabase python-dotenv langchain-huggingface
+    supabase python-dotenv langchain-huggingface sentence-transformers
 
 # --- Copy Worker scripts into the image ---
 # These are our cfdqanda-server files that orchestrate Foam-Agent execution.
