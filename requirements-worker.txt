@@ -1,0 +1,19 @@
+# Worker dependencies — for documentation only.
+# These are ALL already included in the leoyue123/foamagent base image
+# (via Foam-Agent's environment.yml), so no pip install is needed in Dockerfile.worker.
+#
+# This file exists to make the dependency relationship explicit.
+# Last verified: 2026-03-05
+
+# --- Already in FoamAgent conda env ---
+supabase==2.27.2          # Supabase client (DB queries, Storage uploads)
+python-dotenv==1.2.1      # .env file loading
+
+# --- Stdlib only (no install needed) ---
+# os, re, sys, time, logging, subprocess, signal, json, shutil,
+# datetime, pathlib, typing, asyncio
+
+# --- Local modules (copied into image) ---
+# allrun_validator.py  — Allrun script security audit (stdlib only)
+# token_extractor.py   — LLM token usage extraction (stdlib only)
+# mcp_client.py        — MCP client for controlled pipeline (stdlib only)

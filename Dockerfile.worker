@@ -1,0 +1,36 @@
+# ---- CFDQandA Worker ----
+# Based on leoyue123/foamagent which already includes:
+#   - OpenFOAM v10
+#   - Miniconda + FoamAgent conda env (Python 3.12, LangGraph, FAISS, etc.)
+#   - supabase, python-dotenv (already in FoamAgent env)
+#
+# This Dockerfile only adds the cfdqanda-server Worker scripts on top.
+# Foam-Agent code is bind-mounted at runtime (not baked in) so we can
+# update it independently via git pull without rebuilding the image.
+#
+# Build:  docker build -f Dockerfile.worker -t cfdqanda-worker .
+# Run:    docker run --env-file .env -v /path/to/Foam-Agent:/home/openfoam/Foam-Agent cfdqanda-worker
+# Size:   Same as leoyue123/foamagent base (~5-8 GB depending on GPU packages)
+
+FROM leoyue123/foamagent:latest
+
+# --- Copy Worker scripts into the image ---
+# These are our cfdqanda-server files that orchestrate Foam-Agent execution.
+WORKDIR /app/worker
+
+COPY worker.py .
+COPY allrun_validator.py .
+COPY token_extractor.py .
+COPY mcp_client.py .
+
+# --- Worker entrypoint ---
+# The base image's entrypoint (foamagent-entrypoint.sh) sources OpenFOAM and
+# activates the FoamAgent conda env, then exec's the passed command.
+# We override CMD to run our Worker instead of an interactive bash shell.
+#
+# The entrypoint handles:
+#   1. source /opt/openfoam10/etc/bashrc  (OpenFOAM env vars + PATH)
+#   2. conda activate FoamAgent           (Python 3.12 + all ML/CFD deps)
+#   3. exec "$@"                          (runs our CMD below)
+
+CMD ["python", "-u", "worker.py"]
