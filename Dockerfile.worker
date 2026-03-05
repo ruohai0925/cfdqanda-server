@@ -33,4 +33,4 @@ COPY mcp_client.py .
 #   2. conda activate FoamAgent           (Python 3.12 + all ML/CFD deps)
 #   3. exec "$@"                          (runs our CMD below)
 
-CMD ["python", "-u", "worker.py"]
+CMD ["python", "-u", "/app/worker/worker.py"]
