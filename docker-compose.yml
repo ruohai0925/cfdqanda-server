@@ -1,0 +1,82 @@
+# ---- CFDQandA Docker Compose ----
+#
+# Orchestrates two services:
+#   - api:    FastAPI server (lightweight, ~200 MB image, ~200 MB RAM)
+#   - worker: Foam-Agent Worker (heavy, ~5-8 GB image, ~4.5 GB RAM per replica)
+#
+# Prerequisites:
+#   1. Build images first:
+#        docker build -f Dockerfile.api -t cfdqanda-api .
+#        docker build -f Dockerfile.worker -t cfdqanda-worker .
+#   2. Copy .env.example -> .env and fill in credentials
+#   3. Clone Foam-Agent repo to the path specified in FOAM_AGENT_HOST_PATH
+#
+# Usage:
+#   docker compose up -d                  # Start all services
+#   docker compose up -d --scale worker=2 # Start with 2 Workers
+#   docker compose logs -f worker         # Follow Worker logs
+#   docker compose ps                     # Check service status
+#   docker compose down                   # Stop all services
+#
+# Network: cloudflared (running on host) forwards api.cfdqanda.com -> localhost:8000
+
+services:
+  # --- API Server ---
+  # Lightweight FastAPI server handling HTTP requests.
+  # cloudflared on the host forwards external HTTPS traffic to port 8000.
+  api:
+    image: cfdqanda-api:latest
+    container_name: cfdqanda-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --- Worker ---
+  # Polls Supabase for queued jobs, runs Foam-Agent subprocess (OpenFOAM + LLM).
+  # Each replica is an independent process that claims jobs atomically via
+  # PostgreSQL FOR UPDATE SKIP LOCKED — safe to scale to multiple replicas.
+  #
+  # Memory: ~4.5 GB per replica (Qwen3-Embedding-0.6B model = 3.4 GB).
+  # On 16 GB VM: max 2 replicas safely, 3 at the limit.
+  worker:
+    image: cfdqanda-worker:latest
+    env_file: .env
+    environment:
+      # Override FOAM_AGENT_DIR to match the bind mount path inside the container.
+      # The .env file may have a host-specific path (e.g. /home/yzeng/Codes/...),
+      # but inside the container it's always at this fixed path.
+      - FOAM_AGENT_DIR=/home/openfoam/Foam-Agent
+    volumes:
+      # Bind mount Foam-Agent repo from host into the container.
+      # This overrides the baked-in copy, allowing git pull without rebuilding.
+      # Set FOAM_AGENT_HOST_PATH in .env to the absolute host path.
+      - ${FOAM_AGENT_HOST_PATH:-./Foam-Agent}:/home/openfoam/Foam-Agent
+    restart: unless-stopped
+    deploy:
+      replicas: 1    # Scale: docker compose up -d --scale worker=2
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 4G
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
