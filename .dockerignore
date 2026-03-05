@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Environment (secrets must be passed via --env-file or docker-compose env_file)
+.env
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Tests (not needed in production image)
+tests/
+
+# Docs
+README.md
+README_zh.md
+LICENSE
+
+# OS
+.DS_Store
+Thumbs.db
