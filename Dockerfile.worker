@@ -2,9 +2,11 @@
 # Based on leoyue123/foamagent which already includes:
 #   - OpenFOAM v10
 #   - Miniconda + FoamAgent conda env (Python 3.12, LangGraph, FAISS, etc.)
-#   - supabase, python-dotenv (already in FoamAgent env)
 #
-# This Dockerfile only adds the cfdqanda-server Worker scripts on top.
+# This Dockerfile adds:
+#   1. Worker-specific Python deps (supabase, python-dotenv) into the conda env
+#   2. The 4 cfdqanda-server Worker scripts
+#
 # Foam-Agent code is bind-mounted at runtime (not baked in) so we can
 # update it independently via git pull without rebuilding the image.
 #
@@ -13,6 +15,12 @@
 # Size:   Same as leoyue123/foamagent base (~5-8 GB depending on GPU packages)
 
 FROM leoyue123/foamagent:latest
+
+# --- Install Worker-specific dependencies into the FoamAgent conda env ---
+# The base image's conda env does not include supabase or python-dotenv.
+# Use the conda env's pip directly (entrypoint is not active during build).
+RUN /opt/conda/envs/FoamAgent/bin/pip install --no-cache-dir \
+    supabase python-dotenv
 
 # --- Copy Worker scripts into the image ---
 # These are our cfdqanda-server files that orchestrate Foam-Agent execution.
