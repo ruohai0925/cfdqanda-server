@@ -67,6 +67,9 @@ services:
       # This overrides the baked-in copy, allowing git pull without rebuilding.
       # Set FOAM_AGENT_HOST_PATH in .env to the absolute host path.
       - ${FOAM_AGENT_HOST_PATH:-./Foam-Agent}:/home/openfoam/Foam-Agent
+      # Mount Codex OAuth token for openai-codex provider.
+      # On host: ~/.codex/auth.json (created by `codex login`)
+      - ~/.codex:/home/openfoam/.codex:ro
     restart: unless-stopped
     deploy:
       replicas: 1    # Scale: docker compose up -d --scale worker=2
