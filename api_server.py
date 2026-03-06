@@ -12,6 +12,8 @@ from typing import Optional, List
 from datetime import datetime, timezone
 import logging
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import jwt
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -23,6 +25,9 @@ from slowapi.errors import RateLimitExceeded
 # 配置日志记录，方便我们调试
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Thread pool for running sync I/O (file writes, storage uploads) without blocking the event loop
+_io_executor = ThreadPoolExecutor(max_workers=4)
 
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
@@ -266,8 +271,8 @@ async def submit_feedback(request: Request, job_id: int, fb_request: FeedbackReq
     2. 上传到 Supabase Storage (云端备份)
     """
     try:
-        # 1. 验证任务是否存在
-        response = supabase.table('simulations').select('*').eq('id', job_id).execute()
+        # 1. 验证任务是否存在（只查必要字段，避免传输大量 result_data）
+        response = supabase.table('simulations').select('id, user_id').eq('id', job_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
 
@@ -294,40 +299,43 @@ async def submit_feedback(request: Request, job_id: int, fb_request: FeedbackReq
             raise HTTPException(status_code=400, detail="Invalid file_path: path traversal is not allowed")
 
         # ==========================================
-        # 写入本地 WSL 文件系统（Foam-Agent/runs/ 下）
+        # 并行执行：本地写入 + 云端上传（避免串行阻塞）
         # ==========================================
-        try:
-            local_file_path = str(resolved_feedback_path)
+        local_file_path = str(resolved_feedback_path)
+        storage_base_path = f"public/{user_id}/{job_id}"
+        storage_feedback_path = f"{storage_base_path}/{feedback_file_path}"
+        loop = asyncio.get_event_loop()
 
-            # 确保父目录存在 (防止报错)
+        def _write_local():
             os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-
-            # 写入文件
             with open(local_file_path, "w", encoding="utf-8") as f:
                 f.write(fb_request.feedback_content)
 
-            logger.info(f"Feedback saved locally to: {local_file_path}")
-
-        except Exception as local_error:
-            # 如果本地写入失败（比如权限问题），记录日志但不中断请求
-            logger.error(f"Failed to write local feedback file: {local_error}")
-
-        # ==========================================
-
-        # 5. 上传到 Supabase Storage (保持原有逻辑)
-        storage_base_path = f"public/{user_id}/{job_id}"
-        storage_feedback_path = f"{storage_base_path}/{feedback_file_path}"
-
-        try:
+        def _upload_cloud():
             supabase.storage.from_("simulation_results").upload(
                 path=storage_feedback_path,
                 file=fb_request.feedback_content.encode('utf-8'),
                 file_options={"content-type": "text/plain", "upsert": "true"}
             )
+
+        local_task = loop.run_in_executor(_io_executor, _write_local)
+        cloud_task = loop.run_in_executor(_io_executor, _upload_cloud)
+
+        # 等待两个任务完成，收集结果
+        results = await asyncio.gather(local_task, cloud_task, return_exceptions=True)
+
+        # 处理本地写入结果（失败不中断）
+        if isinstance(results[0], Exception):
+            logger.error(f"Failed to write local feedback file: {results[0]}")
+        else:
+            logger.info(f"Feedback saved locally to: {local_file_path}")
+
+        # 处理云端上传结果（失败则报错）
+        if isinstance(results[1], Exception):
+            logger.error(f"Storage upload failed: {results[1]}")
+            raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(results[1])}")
+        else:
             logger.info(f"Feedback uploaded to Supabase: {storage_feedback_path}")
-        except Exception as storage_error:
-            logger.error(f"Storage upload failed: {storage_error}")
-            raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(storage_error)}")
 
         return {
             "status": "success",
@@ -359,7 +367,7 @@ async def submit_rating(request: Request, job_id: str, rating_request: RatingReq
         raise HTTPException(status_code=400, detail="Comment must be 500 characters or less")
 
     try:
-        response = supabase.table('simulations').select('id, user_id').eq('id', job_id).execute()
+        response = supabase.table('simulations').select('id, user_id, stage_ratings').eq('id', job_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
 
@@ -370,8 +378,7 @@ async def submit_rating(request: Request, job_id: str, rating_request: RatingReq
         stage = rating_request.stage
         if stage:
             # Per-stage rating: store in stage_ratings JSONB column
-            existing = supabase.table('simulations').select('stage_ratings').eq('id', job_id).execute()
-            stage_ratings = (existing.data[0].get('stage_ratings') or {}) if existing.data else {}
+            stage_ratings = job.get('stage_ratings') or {}
             stage_ratings[stage] = {
                 'rating': rating_request.rating,
                 'comment': rating_request.comment or '',
