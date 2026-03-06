@@ -752,7 +752,40 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- 11. Account deletion (GDPR "right to erasure") ---
+# --- 11. User profile creation (fallback when RLS blocks frontend insert) ---
+
+class ProfileRequest(BaseModel):
+    display_name: str
+    organization: Optional[str] = None
+
+@app.post("/api/v1/users/me/profile")
+@limiter.limit("5/minute")
+async def create_profile(request: Request, profile: ProfileRequest, user_id: str = Depends(verify_jwt)):
+    """
+    Create user profile via service_role (bypasses RLS).
+    Called by frontend as fallback when direct Supabase insert fails.
+    """
+    try:
+        # Check if profile already exists
+        existing = supabase.table('user_profiles').select('id').eq('id', user_id).execute()
+        if existing.data:
+            return {"status": "exists", "message": "Profile already exists"}
+
+        supabase.table('user_profiles').insert({
+            'id': user_id,
+            'display_name': profile.display_name,
+            'organization': profile.organization,
+            'privacy_accepted_at': datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        logger.info(f"Created profile for user {user_id}")
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error creating profile: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 12. Account deletion (GDPR "right to erasure") ---
 
 @app.delete("/api/v1/users/me")
 @limiter.limit("3/minute")
