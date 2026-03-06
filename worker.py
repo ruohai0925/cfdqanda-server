@@ -7,7 +7,9 @@ import subprocess
 import signal
 import json
 import shutil
+import threading
 from datetime import datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from supabase import create_client, Client
 from allrun_validator import audit_allrun_scripts
@@ -54,6 +56,9 @@ logger.info(f"Cancel check interval set to {CANCEL_CHECK_INTERVAL} seconds")
 # Pre-run timeout (seconds). Default: 300 (5 minutes). Much shorter than full simulation.
 PRE_RUN_TIMEOUT = int(os.environ.get("PRE_RUN_TIMEOUT", "300"))
 logger.info(f"Pre-run timeout set to {PRE_RUN_TIMEOUT} seconds")
+
+# Health check HTTP server port. Set to 0 to disable.
+HEALTH_CHECK_PORT = int(os.environ.get("HEALTH_CHECK_PORT", "8001"))
 
 # --- Middleware directory configuration ---
 MIDDLEWARE_DIR = os.environ.get("MIDDLEWARE_DIR")
@@ -650,6 +655,9 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
         update_data.update(extra_fields)
 
     supabase.table('simulations').update(update_data).eq('id', job_id).execute()
+    _increment_stat('jobs_processed')
+    _increment_stat('jobs_failed')
+    _update_stats(current_job_id=None)
 
 
 def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun_audit,
@@ -729,6 +737,9 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
 
     logger.info(f"Job {job_id} completed and all files uploaded successfully. "
                f"Total files: {uploaded_count}, Failed: {failed_count}")
+    _increment_stat('jobs_processed')
+    _increment_stat('jobs_succeeded')
+    _update_stats(current_job_id=None)
 
 
 # --- 7. MCP controlled pipeline ---
@@ -1282,6 +1293,7 @@ def find_and_process_job():
 
     job = response.data[0]
     job_id = job['id']
+    _update_stats(current_job_id=job_id)
     logger.info(f"[{WORKER_ID}] Claimed job {job_id} via claim_next_job() RPC. Processing...")
 
     # --- Controlled pipeline mode: MCP stage-by-stage ---
@@ -1418,7 +1430,67 @@ def find_and_process_job():
     return True
 
 
-# --- 8. 主循环 ---
+# --- 8. Health check HTTP server ---
+
+_worker_stats = {
+    'start_time': datetime.now(timezone.utc).isoformat(),
+    'jobs_processed': 0,
+    'jobs_succeeded': 0,
+    'jobs_failed': 0,
+    'current_job_id': None,
+}
+_stats_lock = threading.Lock()
+
+
+def _update_stats(**kwargs):
+    with _stats_lock:
+        _worker_stats.update(kwargs)
+
+
+def _increment_stat(key):
+    with _stats_lock:
+        _worker_stats[key] = _worker_stats.get(key, 0) + 1
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/health':
+            self.send_response(404)
+            self.end_headers()
+            return
+        with _stats_lock:
+            stats = dict(_worker_stats)
+        stats['worker_id'] = WORKER_ID
+        stats['status'] = 'busy' if stats.get('current_job_id') else 'idle'
+        start = datetime.fromisoformat(stats['start_time'])
+        uptime = datetime.now(timezone.utc) - start
+        stats['uptime_seconds'] = int(uptime.total_seconds())
+        body = json.dumps(stats).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # Suppress default access logs
+
+
+def _start_health_server():
+    """Start health check HTTP server in a daemon thread."""
+    if HEALTH_CHECK_PORT == 0:
+        logger.info("Health check server disabled (HEALTH_CHECK_PORT=0)")
+        return
+    try:
+        server = HTTPServer(('0.0.0.0', HEALTH_CHECK_PORT), _HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"[{WORKER_ID}] Health check server listening on port {HEALTH_CHECK_PORT}")
+    except OSError as e:
+        logger.warning(f"Failed to start health check server on port {HEALTH_CHECK_PORT}: {e}")
+
+
+# --- 9. 主循环 ---
 
 def _warmup_mcp_server():
     """Pre-start MCP server at Worker boot to avoid cold-start latency on first job."""
@@ -1433,6 +1505,9 @@ def main_loop():
     """
     无限循环，不断地寻找并处理任务。
     """
+    # Start health check HTTP server (daemon thread)
+    _start_health_server()
+
     # Recover any stale jobs from previous Worker crashes
     recover_stale_jobs()
 

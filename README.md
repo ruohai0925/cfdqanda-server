@@ -131,6 +131,7 @@ pkill -f "uvicorn api_server:app"
 | `STALE_JOB_THRESHOLD` | No | `7200` | Seconds before a running job is considered stale |
 | `MCP_SERVER_PORT` | No | `7860` | MCP server port for controlled pipeline |
 | `WORKER_ID` | No | `worker-{PID}` | Unique identifier for multi-worker setups |
+| `HEALTH_CHECK_PORT` | No | `8001` | Worker health check HTTP port (set to `0` to disable) |
 
 ## How It Works
 
@@ -173,6 +174,15 @@ Users can provide their own LLM config (provider, model, API key or Codex OAuth 
 ### Multi-Worker Concurrency
 
 Multiple workers can run safely in parallel — `claim_next_job()` RPC uses PostgreSQL `FOR UPDATE SKIP LOCKED` to prevent duplicate claims. Each worker gets a unique `WORKER_ID` for log identification.
+
+### Health Check
+
+Each worker exposes `GET /health` on `HEALTH_CHECK_PORT` (default 8001):
+
+```bash
+curl localhost:8001/health
+# {"status":"idle","worker_id":"worker-123","jobs_processed":5,"jobs_succeeded":3,"jobs_failed":2,"current_job_id":null,"uptime_seconds":3600,"start_time":"..."}
+```
 
 ## Tests
 

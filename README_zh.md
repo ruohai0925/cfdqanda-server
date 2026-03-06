@@ -158,6 +158,7 @@ pkill -f "uvicorn api_server:app"
 | `STALE_JOB_THRESHOLD` | 否 | stale job 检测阈值（秒），默认 `7200`（2 小时）。启动时重置超过此阈值仍为 `running` 的任务 |
 | `MCP_SERVER_PORT` | 否 | MCP 服务端口，默认 `7860` |
 | `WORKER_ID` | 否 | Worker 唯一标识（默认 `worker-{PID}`），多 Worker 部署时用于区分日志 |
+| `HEALTH_CHECK_PORT` | 否 | Worker 健康检查 HTTP 端口，默认 `8001`。设为 `0` 禁用 |
 
 ## 工作流程
 
@@ -212,6 +213,15 @@ Worker 内置自动清理机制（每小时检查一次）：
 ### 多 Worker 并发
 
 多个 Worker 可以安全并发运行 —— `claim_next_job()` RPC 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 防止重复领取。每个 Worker 通过 `WORKER_ID` 环境变量标识，日志中包含 Worker 标识便于排查。
+
+### 健康检查
+
+每个 Worker 暴露 `GET /health` 端点（默认端口 8001）：
+
+```bash
+curl localhost:8001/health
+# {"status":"idle","worker_id":"worker-123","jobs_processed":5,"jobs_succeeded":3,"jobs_failed":2,"current_job_id":null,"uptime_seconds":3600,"start_time":"..."}
+```
 
 ## 测试
 
