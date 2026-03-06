@@ -80,9 +80,9 @@ services:
       replicas: 1    # Scale: docker compose up -d --scale worker=2
       resources:
         limits:
-          memory: 6G
+          memory: 5G
         reservations:
-          memory: 4G
+          memory: 3G
     logging:
       driver: json-file
       options:

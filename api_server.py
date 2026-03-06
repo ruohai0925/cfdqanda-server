@@ -226,8 +226,8 @@ async def get_file_tree(job_id: int):
 
         job = response.data[0]
 
-        # Check if task has files to browse (completed, failed, or checkpoint)
-        if job['status'] not in ['completed', 'failed', 'checkpoint']:
+        # Check if task has files to browse
+        if job['status'] not in ['completed', 'failed', 'checkpoint', 'cancelled']:
             raise HTTPException(
                 status_code=400,
                 detail=f"Simulation {job_id} has no files yet. Current status: {job['status']}"
@@ -466,10 +466,10 @@ async def cancel_simulation(request: Request, job_id: str, user_id: str = Depend
         job = response.data[0]
         if job['user_id'] != user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
-        if job['status'] not in ('queued', 'running'):
+        if job['status'] not in ('queued', 'running', 'checkpoint'):
             raise HTTPException(
                 status_code=409,
-                detail=f"Cannot cancel a simulation with status '{job['status']}'. Only queued or running simulations can be cancelled."
+                detail=f"Cannot cancel a simulation with status '{job['status']}'. Only queued, running, or checkpoint simulations can be cancelled."
             )
 
         supabase.table('simulations').update(
