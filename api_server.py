@@ -871,7 +871,7 @@ async def delete_account(request: Request, user_id: str = Depends(verify_jwt)):
 
 # --- 13. Admin status endpoint (monitoring) ---
 
-@app.get("/api/v1/admin/status")
+@app.api_route("/api/v1/admin/status", methods=["GET", "HEAD"])
 def admin_status():
     """
     Aggregated health check: API server status + Worker health.
