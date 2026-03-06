@@ -62,6 +62,8 @@ services:
       # The .env file may have a host-specific path (e.g. /home/yzeng/Codes/...),
       # but inside the container it's always at this fixed path.
       - FOAM_AGENT_DIR=/home/openfoam/Foam-Agent
+      # Override MIDDLEWARE_DIR to match the bind mount path inside the container.
+      - MIDDLEWARE_DIR=/app/middleware
     volumes:
       # Bind mount Foam-Agent repo from host into the container.
       # This overrides the baked-in copy, allowing git pull without rebuilding.
@@ -70,6 +72,9 @@ services:
       # Mount Codex OAuth token for openai-codex provider.
       # On host: ~/.codex/auth.json (created by `codex login`)
       - ~/.codex:/home/openfoam/.codex:ro
+      # Mount checkpoint middleware (optional, enables pre-run mechanism).
+      # Set MIDDLEWARE_HOST_PATH in .env to the absolute host path.
+      - ${MIDDLEWARE_HOST_PATH:-./cfdqanda-middleware}:/app/middleware
     restart: unless-stopped
     deploy:
       replicas: 1    # Scale: docker compose up -d --scale worker=2
