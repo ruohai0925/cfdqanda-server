@@ -811,8 +811,11 @@ def _sanitize_case_dir(case_dir):
     if sanitized != basename:
         new_case_dir = os.path.join(parent, sanitized)
         if os.path.exists(new_case_dir):
-            # Avoid collision — append a short suffix
-            new_case_dir = new_case_dir + '_1'
+            # Avoid collision — find a free suffix
+            suffix = 1
+            while os.path.exists(f"{new_case_dir}_{suffix}"):
+                suffix += 1
+            new_case_dir = f"{new_case_dir}_{suffix}"
         os.rename(case_dir, new_case_dir)
         logger.info(f"Sanitized case dir: {basename} -> {os.path.basename(new_case_dir)}")
         return new_case_dir
