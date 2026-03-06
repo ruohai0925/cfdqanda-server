@@ -140,6 +140,7 @@ class FeedbackRequest(BaseModel):
 class RatingRequest(BaseModel):
     rating: int  # 1=success, 2=partial success, 3=failed
     comment: Optional[str] = None
+    stage: Optional[str] = None  # pipeline stage (e.g. 'files_review', 'pre_run_review', 'completed')
 
 # --- 3. 创建 API 端点 (Endpoint) ---
 
@@ -366,13 +367,25 @@ async def submit_rating(request: Request, job_id: str, rating_request: RatingReq
         if job['user_id'] != user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
-        update_data = {'user_rating': rating_request.rating}
-        if rating_request.comment is not None:
-            update_data['user_comment'] = rating_request.comment
+        stage = rating_request.stage
+        if stage:
+            # Per-stage rating: store in stage_ratings JSONB column
+            existing = supabase.table('simulations').select('stage_ratings').eq('id', job_id).execute()
+            stage_ratings = (existing.data[0].get('stage_ratings') or {}) if existing.data else {}
+            stage_ratings[stage] = {
+                'rating': rating_request.rating,
+                'comment': rating_request.comment or '',
+            }
+            update_data = {'stage_ratings': stage_ratings}
+        else:
+            # Legacy: store in user_rating/user_comment columns (auto mode)
+            update_data = {'user_rating': rating_request.rating}
+            if rating_request.comment is not None:
+                update_data['user_comment'] = rating_request.comment
 
         supabase.table('simulations').update(update_data).eq('id', job_id).execute()
 
-        logger.info(f"Rating {rating_request.rating} submitted for job {job_id} by user {user_id}")
+        logger.info(f"Rating {rating_request.rating} submitted for job {job_id} stage={stage} by user {user_id}")
         return {"status": "success", "message": "Rating submitted successfully"}
 
     except HTTPException:
