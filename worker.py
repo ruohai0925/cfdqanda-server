@@ -609,6 +609,21 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
             uploaded_count, failed_count, total_bytes = upload_directory_to_storage(
                 run_dir, storage_base_path, supabase
             )
+            # Create and upload ZIP archive
+            zip_storage_path = f"{storage_base_path}/result.zip"
+            try:
+                zip_path_base = os.path.join(run_dir, "result")
+                shutil.make_archive(zip_path_base, 'zip', run_dir)
+                zip_file_path = f"{zip_path_base}.zip"
+                with open(zip_file_path, 'rb') as f:
+                    supabase.storage.from_("simulation_results").upload(
+                        path=zip_storage_path, file=f)
+                os.remove(zip_file_path)
+                result_data['zip_storage_path'] = zip_storage_path
+                logger.info(f"Job {job_id} (failed): uploaded ZIP to {zip_storage_path}")
+            except Exception as e:
+                logger.warning(f"Job {job_id}: failed to create/upload ZIP on failure: {e}")
+
             result_data['storage_base_path'] = storage_base_path
             result_data['file_tree'] = file_tree
             result_data['upload_stats'] = {
