@@ -34,8 +34,8 @@ Two execution modes:
 | `allrun_validator.py` | Security audit for OpenFOAM Allrun scripts (whitelist-based command validation) |
 | `token_extractor.py` | Extracts LLM token usage statistics from simulation logs |
 | `cleanup_runs.sh` | Manual disk cleanup script for local `runs/` directories (supports `--all`, `--id`, `--range`, `--before`, `--largest N`, `--dry-run`) |
-| `start_workers.sh` | Start multiple Worker processes with separate WORKER_IDs, MCP ports, and log files |
-| `submit_test_tasks.sh` | Batch-submit test tasks via Supabase Auth login (for multi-worker testing) |
+| `docker_start_workers.sh` | Start multiple Worker containers with separate WORKER_IDs, MCP ports, and log files |
+| `docker_submit_test_tasks.sh` | Batch-submit test tasks via Supabase Auth login (for multi-worker testing) |
 | `.env.example` | Environment variables template |
 | `tests/` | 13 test files covering auth, security, concurrency, pipeline, etc. |
 
@@ -72,7 +72,7 @@ python -u worker.py
 ### Multi-Worker (concurrency testing)
 
 ```bash
-./start_workers.sh 3    # Start 3 workers with separate IDs and logs
+./docker_start_workers.sh 3    # Start 3 workers with separate IDs and logs
 ```
 
 ### Background mode

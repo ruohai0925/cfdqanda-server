@@ -46,8 +46,8 @@ Worker（轮询循环）
 | `allrun_validator.py` | Allrun 安全审计 —— 解析 Allrun 脚本，检测危险命令（`rm -rf`、`curl` 等），白名单验证 |
 | `token_extractor.py` | Token 用量提取 —— 从仿真日志中解析 LLM API 调用的 token 消耗 |
 | `cleanup_runs.sh` | 手动磁盘清理脚本 —— 按需删除本地 `runs/` 目录（支持 `--all`、`--id`、`--range`、`--before`、`--largest N`、`--dry-run`） |
-| `start_workers.sh` | 多 Worker 启动脚本 —— 一键启动 N 个 Worker，每个有独立 WORKER_ID、MCP 端口、日志文件 |
-| `submit_test_tasks.sh` | 测试任务批量提交脚本 —— 通过 Supabase Auth 登录后快速提交 N 个测试任务 |
+| `docker_start_workers.sh` | 多 Worker 启动脚本 —— 一键启动 N 个 Worker 容器，每个有独立 WORKER_ID、MCP 端口、日志文件 |
+| `docker_submit_test_tasks.sh` | 测试任务批量提交脚本 —— 通过 Supabase Auth 登录后快速提交 N 个测试任务 |
 | `.env` | 环境变量（不提交到 git） |
 | `.env.example` | `.env` 模板 |
 
@@ -95,7 +95,7 @@ python -u worker.py
 ### 多 Worker（并发测试）
 
 ```bash
-./start_workers.sh 3    # 启动 3 个 Worker，各自独立 ID 和日志
+./docker_start_workers.sh 3    # 启动 3 个 Worker 容器，各自独立 ID 和日志
 ```
 
 ### 后台模式（生产环境）
