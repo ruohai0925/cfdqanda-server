@@ -367,7 +367,9 @@ async def submit_rating(request: Request, job_id: str, rating_request: RatingReq
         raise HTTPException(status_code=400, detail="Comment must be 500 characters or less")
 
     try:
-        response = supabase.table('simulations').select('id, user_id, stage_ratings').eq('id', job_id).execute()
+        response = supabase.table('simulations').select(
+            'id, user_id, stage_ratings, pipeline_mode, pipeline_stage, status'
+        ).eq('id', job_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Simulation {job_id} not found")
 
@@ -376,14 +378,28 @@ async def submit_rating(request: Request, job_id: str, rating_request: RatingReq
             raise HTTPException(status_code=403, detail="Permission denied")
 
         stage = rating_request.stage
+        # Auto-derive stage for controlled pipeline when frontend doesn't pass it
+        if not stage and job.get('pipeline_mode') == 'controlled':
+            if job.get('status') == 'checkpoint':
+                stage = job.get('pipeline_stage')
+            elif job.get('status') == 'completed':
+                stage = 'completed'
+            elif job.get('status') == 'failed':
+                stage = job.get('pipeline_stage') or 'failed'
+
         if stage:
-            # Per-stage rating: store in stage_ratings JSONB column
+            # Per-stage rating: store in stage_ratings JSONB (accumulative, never overwritten)
             stage_ratings = job.get('stage_ratings') or {}
             stage_ratings[stage] = {
                 'rating': rating_request.rating,
                 'comment': rating_request.comment or '',
             }
-            update_data = {'stage_ratings': stage_ratings}
+            # Also update user_rating/user_comment so the latest rating is always accessible
+            update_data = {
+                'stage_ratings': stage_ratings,
+                'user_rating': rating_request.rating,
+                'user_comment': rating_request.comment or '',
+            }
         else:
             # Legacy: store in user_rating/user_comment columns (auto mode)
             update_data = {'user_rating': rating_request.rating}
