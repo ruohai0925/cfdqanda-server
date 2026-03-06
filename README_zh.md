@@ -53,12 +53,9 @@ Worker（轮询循环）
 
 ## 前置条件
 
+- **Docker Engine** 已安装（已在 WSL2 和 GCP 上测试通过）
 - **Foam-Agent** 仓库已克隆到本地（服务器通过子进程/MCP 调用它）
-- **Conda 环境** 已创建：
-  - `foam-api` —— 运行 API 服务器（`fastapi`, `uvicorn`, `supabase`, `pydantic`, `python-dotenv`, `PyJWT`, `slowapi`）
-  - `FoamAgent` —— 运行 Worker（继承 Foam-Agent 的完整依赖）
 - **Supabase** 项目已配置（`simulations` 表 + `user_profiles` 表 + `simulation_results` 存储桶 + `claim_next_job` RPC 函数）
-- **OpenFOAM v10** 已安装（Foam-Agent 需要）
 
 ## 安装配置
 
@@ -76,42 +73,33 @@ FOAM_AGENT_DIR=/home/youruser/path/to/Foam-Agent
 
 ## 启动
 
-### API 服务器
+### Docker Compose（推荐）
 
 ```bash
-cd cfdqanda-server
-conda activate foam-api
-uvicorn api_server:app --host 0.0.0.0 --port 8000
-```
+# 构建镜像（首次或代码变更后）
+docker build -f Dockerfile.api -t cfdqanda-api .
+docker build -f Dockerfile.worker -t cfdqanda-worker .
 
-### Worker
+# 启动所有服务
+docker compose up -d
 
-```bash
-cd cfdqanda-server
-conda activate FoamAgent
-python -u worker.py
+# 查看日志
+docker compose logs -f api
+docker compose logs -f worker
+
+# 检查状态
+docker compose ps
+
+# 停止
+docker compose down
 ```
 
 ### 多 Worker（并发测试）
 
 ```bash
-./docker_start_workers.sh 3    # 启动 3 个 Worker 容器，各自独立 ID 和日志
-```
-
-### 后台模式（生产环境）
-
-```bash
-nohup uvicorn api_server:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
-nohup python -u worker.py > worker.log 2>&1 &
-```
-
-### 停止服务
-
-```bash
-# 使用 pkill -f（匹配完整命令行），不要用 kill $PID。
-# nohup 返回的是 bash 包装进程的 PID，不是实际的 Python 进程。
-pkill -f "python.*worker\.py"
-pkill -f "uvicorn api_server:app"
+docker compose up -d --scale worker=3
+# 或使用辅助脚本：
+./docker_start_workers.sh 3
 ```
 
 ### 磁盘清理
@@ -257,7 +245,10 @@ curl localhost:8000/api/v1/admin/status
 ## 测试
 
 ```bash
-cd cfdqanda-server
-conda activate foam-api
-pytest tests/
+# 在 API 容器中运行测试
+docker compose exec api python -m pytest tests/ -v
+
+# 或本地安装依赖后运行
+pip install -r requirements-api.txt
+python -m pytest tests/ -v
 ```

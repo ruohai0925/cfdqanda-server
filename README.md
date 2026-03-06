@@ -41,10 +41,9 @@ Two execution modes:
 
 ## Prerequisites
 
+- Docker Engine installed (tested on WSL2 and GCP)
 - Foam-Agent repository cloned locally
-- Conda environments: `foam-api` (API server), `FoamAgent` (worker)
 - Supabase project with `simulations` table, `user_profiles` table, `simulation_results` storage bucket, and `claim_next_job` RPC function
-- OpenFOAM v10 installed
 
 ## Setup
 
@@ -55,38 +54,33 @@ cp .env.example .env
 
 ## Running
 
-### API Server
+### Docker Compose (recommended)
 
 ```bash
-conda activate foam-api
-uvicorn api_server:app --host 0.0.0.0 --port 8000
-```
+# Build images (first time only, or after code changes)
+docker build -f Dockerfile.api -t cfdqanda-api .
+docker build -f Dockerfile.worker -t cfdqanda-worker .
 
-### Worker
+# Start both services
+docker compose up -d
 
-```bash
-conda activate FoamAgent
-python -u worker.py
+# View logs
+docker compose logs -f api
+docker compose logs -f worker
+
+# Check status
+docker compose ps
+
+# Stop
+docker compose down
 ```
 
 ### Multi-Worker (concurrency testing)
 
 ```bash
-./docker_start_workers.sh 3    # Start 3 workers with separate IDs and logs
-```
-
-### Background mode
-
-```bash
-nohup uvicorn api_server:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
-nohup python -u worker.py > worker.log 2>&1 &
-```
-
-### Stopping
-
-```bash
-pkill -f "python.*worker\.py"
-pkill -f "uvicorn api_server:app"
+docker compose up -d --scale worker=3
+# Or use the helper script:
+./docker_start_workers.sh 3
 ```
 
 ### Disk Cleanup
@@ -218,6 +212,9 @@ With UptimeRobot configured, step 1 is automated — you get an email alert when
 ## Tests
 
 ```bash
-conda activate foam-api
+# Run tests inside the API container
+docker compose exec api python -m pytest tests/ -v
+
+# Or locally with pip install -r requirements-api.txt
 python -m pytest tests/ -v
 ```
