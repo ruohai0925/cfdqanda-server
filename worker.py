@@ -1402,12 +1402,24 @@ def find_and_process_job():
 
 # --- 8. 主循环 ---
 
+def _warmup_mcp_server():
+    """Pre-start MCP server at Worker boot to avoid cold-start latency on first job."""
+    try:
+        _ensure_mcp_server()
+        logger.info("MCP server pre-warmed successfully")
+    except Exception as e:
+        logger.warning(f"MCP server pre-warm failed (will retry on first job): {e}")
+
+
 def main_loop():
     """
     无限循环，不断地寻找并处理任务。
     """
     # Recover any stale jobs from previous Worker crashes
     recover_stale_jobs()
+
+    # Pre-start MCP server so the first controlled-pipeline job doesn't wait
+    _warmup_mcp_server()
 
     logger.info("Worker started. Looking for jobs...")
     while True:
