@@ -694,7 +694,7 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
     querying Supabase Storage metadata for historical tasks.
     Results cached for 5 minutes to avoid flooding Supabase Storage API.
     """
-    # Check cache first
+    # Check cache first (skip if user just deleted data)
     cached = _storage_cache.get(user_id)
     if cached and time.time() < cached["expires"]:
         return cached["result"]
@@ -750,3 +750,80 @@ async def get_user_storage(request: Request, user_id: str = Depends(verify_jwt))
     except Exception as e:
         logger.error(f"Error in get_user_storage: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 11. Account deletion (GDPR "right to erasure") ---
+
+@app.delete("/api/v1/users/me")
+@limiter.limit("3/minute")
+async def delete_account(request: Request, user_id: str = Depends(verify_jwt)):
+    """
+    Permanently delete the authenticated user's account and all associated data.
+    Deletion order: simulations (hard delete) → Storage files → user_profiles → Auth user.
+    """
+    logger.info(f"Account deletion requested by user {user_id}")
+
+    errors = []
+
+    # 1. Get all user simulations (including soft-deleted)
+    try:
+        sims = supabase.table('simulations').select(
+            'id, result_data'
+        ).eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to query simulations for deletion: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to query user data: {e}")
+
+    # 2. Delete Storage files for each simulation
+    for row in (sims.data or []):
+        rd = row.get('result_data') or {}
+        storage_base = rd.get('storage_base_path')
+        if storage_base:
+            try:
+                # List and delete all files under the storage prefix
+                files = supabase.storage.from_('simulation_results').list(storage_base)
+                if files:
+                    paths = [f"{storage_base}/{f['name']}" for f in files if f.get('id') is not None]
+                    if paths:
+                        supabase.storage.from_('simulation_results').remove(paths)
+            except Exception as e:
+                errors.append(f"Storage cleanup for sim {row['id']}: {e}")
+                logger.warning(f"Storage cleanup error for sim {row['id']}: {e}")
+
+    # 3. Hard-delete all simulations from DB
+    try:
+        supabase.table('simulations').delete().eq('user_id', user_id).execute()
+        logger.info(f"Deleted all simulations for user {user_id}")
+    except Exception as e:
+        errors.append(f"Simulations delete: {e}")
+        logger.error(f"Failed to delete simulations: {e}", exc_info=True)
+
+    # 4. Delete user profile
+    try:
+        supabase.table('user_profiles').delete().eq('id', user_id).execute()
+        logger.info(f"Deleted user_profiles for user {user_id}")
+    except Exception as e:
+        errors.append(f"Profile delete: {e}")
+        logger.warning(f"Failed to delete user_profiles: {e}")
+
+    # 5. Delete Auth user (uses service_role admin API)
+    try:
+        supabase.auth.admin.delete_user(user_id)
+        logger.info(f"Deleted Auth user {user_id}")
+    except Exception as e:
+        errors.append(f"Auth delete: {e}")
+        logger.error(f"Failed to delete Auth user: {e}", exc_info=True)
+
+    # Clear storage cache
+    _storage_cache.pop(user_id, None)
+
+    if errors:
+        logger.warning(f"Account deletion completed with errors for user {user_id}: {errors}")
+        return {
+            "status": "partial",
+            "message": "Account deleted with some cleanup errors. Please contact support if issues persist.",
+            "errors": errors,
+        }
+
+    logger.info(f"Account fully deleted for user {user_id}")
+    return {"status": "success", "message": "Account and all associated data have been permanently deleted."}
