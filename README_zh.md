@@ -163,7 +163,7 @@ plan() → [plan_review 检查点] → input_writer() → [files_review 检查�
 
 - 每个检查点由用户通过前端确认（`stage/confirm`）或拒绝（`stage/reject`）
 - 检查点是可选的，通过提交任务时的 `checkpoints` 参数指定启用哪些
-- 预运行阶段包含自动纠错循环（最多 3 次）：失败 → MCP `review()` + `apply_fixes()` → 重试
+- 预运行阶段包含自动纠错循环（最多 5 次）：失败 → MCP `review()` + `apply_fixes()` → 重试
 - 完整运行不含纠错循环（配置已在预运行阶段验证通过）
 
 ### 数据生命周期

@@ -1038,7 +1038,7 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
     logger.info(f"Job {job_id}: starting pre-run (endTime={pre_run_end_time})")
     _append_mcp_log(job_id, 'pre_run', f"Starting pre-run (endTime={pre_run_end_time})")
 
-    max_pre_run_fix_loops = 3
+    max_pre_run_fix_loops = 5
     pre_run_fix_count = 0
     executor = PreRunExecutor(case_dir, pre_run_end_time)
     checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
