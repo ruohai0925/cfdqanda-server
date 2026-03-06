@@ -1,6 +1,9 @@
 import os
+import json
+import urllib.request
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # --- 新增这两行 ---
 from dotenv import load_dotenv
@@ -28,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Thread pool for running sync I/O (file writes, storage uploads) without blocking the event loop
 _io_executor = ThreadPoolExecutor(max_workers=4)
+
+# Worker health check URL (for admin status endpoint).
+# Docker Compose: http://worker:8001/health; bare metal: http://localhost:8001/health
+WORKER_HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://localhost:8001/health")
 
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
@@ -860,3 +867,33 @@ async def delete_account(request: Request, user_id: str = Depends(verify_jwt)):
 
     logger.info(f"Account fully deleted for user {user_id}")
     return {"status": "success", "message": "Account and all associated data have been permanently deleted."}
+
+
+# --- 13. Admin status endpoint (monitoring) ---
+
+@app.get("/api/v1/admin/status")
+def admin_status():
+    """
+    Aggregated health check: API server status + Worker health.
+    No authentication required — used by UptimeRobot or similar external monitors.
+    Returns HTTP 200 if everything is healthy, 503 if Worker is unreachable.
+    """
+    worker_status = None
+    worker_error = None
+
+    try:
+        req = urllib.request.Request(WORKER_HEALTH_URL, method='GET')
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            worker_status = json.loads(resp.read())
+    except Exception as e:
+        worker_error = str(e)
+
+    all_healthy = worker_status is not None
+    return JSONResponse(
+        status_code=200 if all_healthy else 503,
+        content={
+            "api": "ok",
+            "worker": worker_status if worker_status else {"status": "unreachable", "error": worker_error},
+            "all_healthy": all_healthy,
+        },
+    )

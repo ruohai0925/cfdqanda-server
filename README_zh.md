@@ -141,6 +141,7 @@ pkill -f "uvicorn api_server:app"
 | `GET` | `/api/v1/user/storage` | 获取当前用户的云端存储用量统计（5 分钟缓存） |
 | `POST` | `/api/v1/users/me/profile` | 创建用户 Profile（RLS fallback，5 次/分钟限流） |
 | `DELETE` | `/api/v1/users/me` | 删除账户及所有关联数据（GDPR 被遗忘权，3 次/分钟限流） |
+| `GET` | `/api/v1/admin/status` | 聚合健康检查：API + Worker 状态（无需认证，用于 UptimeRobot 监控） |
 
 ## 环境变量
 
@@ -159,6 +160,7 @@ pkill -f "uvicorn api_server:app"
 | `MCP_SERVER_PORT` | 否 | MCP 服务端口，默认 `7860` |
 | `WORKER_ID` | 否 | Worker 唯一标识（默认 `worker-{PID}`），多 Worker 部署时用于区分日志 |
 | `HEALTH_CHECK_PORT` | 否 | Worker 健康检查 HTTP 端口，默认 `8001`。设为 `0` 禁用 |
+| `WORKER_HEALTH_URL` | 否 | Worker 健康检查 URL，供管理状态端点使用。默认 `http://localhost:8001/health`；Docker 中自动设为 `http://worker:8001/health` |
 
 ## 工作流程
 
@@ -214,14 +216,43 @@ Worker 内置自动清理机制（每小时检查一次）：
 
 多个 Worker 可以安全并发运行 —— `claim_next_job()` RPC 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 防止重复领取。每个 Worker 通过 `WORKER_ID` 环境变量标识，日志中包含 Worker 标识便于排查。
 
-### 健康检查
+### 健康检查与监控
 
-每个 Worker 暴露 `GET /health` 端点（默认端口 8001）：
+三层防御机制，确保管理员能快速发现并修复故障：
+
+| 层级 | 作用 | 实现 |
+|------|------|------|
+| Docker 自愈 | 容器挂了自动重启 | `docker-compose.yml` 中配置 `restart: unless-stopped` + `healthcheck` |
+| 聚合状态端点 | 一个 URL 查看全部状态 | `GET /api/v1/admin/status` 返回 API + Worker 健康信息 |
+| UptimeRobot | 外部告警（邮件） | 每 5 分钟监控聚合端点，异常自动发邮件 |
+
+**Worker 健康检查** —— 每个 Worker 暴露 `GET /health` 端点（默认端口 8001）：
 
 ```bash
 curl localhost:8001/health
 # {"status":"idle","worker_id":"worker-123","jobs_processed":5,"jobs_succeeded":3,"jobs_failed":2,"current_job_id":null,"uptime_seconds":3600,"start_time":"..."}
 ```
+
+**聚合管理端点** —— 同时检查 API 和 Worker 状态（无需认证）：
+
+```bash
+curl localhost:8000/api/v1/admin/status
+# 全部正常（HTTP 200）：
+# {"api":"ok","worker":{"status":"idle","worker_id":"worker-123",...},"all_healthy":true}
+
+# Worker 挂了（HTTP 503）：
+# {"api":"ok","worker":{"status":"unreachable","error":"Connection refused"},"all_healthy":false}
+```
+
+**排障流程**（用户反馈任务一直排队不动时）：
+
+1. 浏览器打开 `https://your-domain/api/v1/admin/status`（不需要登录）
+2. 看 `all_healthy` 字段：
+   - `true` → Worker 活着，问题在别处（检查 Supabase、用户 prompt 等）
+   - `false` → Worker 挂了，执行第 3 步
+3. SSH 到服务器重启：`docker compose restart worker`
+
+配置 UptimeRobot 后，第 1 步由机器自动完成 —— 发现异常发邮件通知，恢复后也会通知。
 
 ## 测试
 

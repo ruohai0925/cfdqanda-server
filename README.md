@@ -114,6 +114,7 @@ pkill -f "uvicorn api_server:app"
 | `GET` | `/api/v1/user/storage` | JWT | Get user's cloud storage usage summary |
 | `POST` | `/api/v1/users/me/profile` | JWT | Create user profile (RLS fallback) |
 | `DELETE` | `/api/v1/users/me` | JWT | Delete account and all associated data (GDPR) |
+| `GET` | `/api/v1/admin/status` | — | Aggregated health: API + Worker status (for UptimeRobot) |
 
 ## Environment Variables
 
@@ -132,6 +133,7 @@ pkill -f "uvicorn api_server:app"
 | `MCP_SERVER_PORT` | No | `7860` | MCP server port for controlled pipeline |
 | `WORKER_ID` | No | `worker-{PID}` | Unique identifier for multi-worker setups |
 | `HEALTH_CHECK_PORT` | No | `8001` | Worker health check HTTP port (set to `0` to disable) |
+| `WORKER_HEALTH_URL` | No | `http://localhost:8001/health` | Worker health URL for admin status endpoint (Docker: `http://worker:8001/health`) |
 
 ## How It Works
 
@@ -175,14 +177,43 @@ Users can provide their own LLM config (provider, model, API key or Codex OAuth 
 
 Multiple workers can run safely in parallel — `claim_next_job()` RPC uses PostgreSQL `FOR UPDATE SKIP LOCKED` to prevent duplicate claims. Each worker gets a unique `WORKER_ID` for log identification.
 
-### Health Check
+### Health Check & Monitoring
 
-Each worker exposes `GET /health` on `HEALTH_CHECK_PORT` (default 8001):
+Three layers of defense ensure the admin can quickly detect and recover from failures:
+
+| Layer | Purpose | How |
+|-------|---------|-----|
+| Docker self-healing | Auto-restart crashed containers | `restart: unless-stopped` + `healthcheck` in docker-compose.yml |
+| Admin status endpoint | One URL to check everything | `GET /api/v1/admin/status` returns API + Worker health |
+| UptimeRobot | External alerting (email) | Monitors the admin status endpoint every 5 minutes |
+
+**Worker health endpoint** — each worker exposes `GET /health` on `HEALTH_CHECK_PORT` (default 8001):
 
 ```bash
 curl localhost:8001/health
 # {"status":"idle","worker_id":"worker-123","jobs_processed":5,"jobs_succeeded":3,"jobs_failed":2,"current_job_id":null,"uptime_seconds":3600,"start_time":"..."}
 ```
+
+**Admin status endpoint** — aggregates API + Worker health into a single check (no auth required):
+
+```bash
+curl localhost:8000/api/v1/admin/status
+# All healthy (HTTP 200):
+# {"api":"ok","worker":{"status":"idle","worker_id":"worker-123",...},"all_healthy":true}
+
+# Worker down (HTTP 503):
+# {"api":"ok","worker":{"status":"unreachable","error":"Connection refused"},"all_healthy":false}
+```
+
+**Troubleshooting workflow** when users report issues (e.g. tasks stuck in queue):
+
+1. Open `https://your-domain/api/v1/admin/status` in a browser (no login needed)
+2. Check `all_healthy`:
+   - `true` — Worker is alive, investigate elsewhere (Supabase, user prompt, etc.)
+   - `false` — Worker is down, proceed to step 3
+3. SSH to server and restart: `docker compose restart worker`
+
+With UptimeRobot configured, step 1 is automated — you get an email alert when something goes wrong, and another when it recovers.
 
 ## Tests
 

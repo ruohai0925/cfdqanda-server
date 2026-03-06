@@ -30,6 +30,10 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      # Worker health URL for the admin status endpoint.
+      # In Docker Compose, API reaches Worker by service name.
+      - WORKER_HEALTH_URL=http://worker:8001/health
     restart: unless-stopped
     deploy:
       resources:
@@ -76,6 +80,12 @@ services:
       # Set MIDDLEWARE_HOST_PATH in .env to the absolute host path.
       - ${MIDDLEWARE_HOST_PATH:-./cfdqanda-middleware}:/app/middleware
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     deploy:
       replicas: 1    # Scale: docker compose up -d --scale worker=2
       resources:
