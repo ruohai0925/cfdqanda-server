@@ -24,6 +24,9 @@ from dotenv import load_dotenv
 load_dotenv()  # 自动读取同目录下的 .env 文件
 # ------------------
 
+# --- Worker identification (for multi-worker setups) ---
+WORKER_ID = os.environ.get("WORKER_ID", f"worker-{os.getpid()}")
+
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
 if not FOAM_AGENT_DIR:
@@ -75,7 +78,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 logger.info("Initializing Supabase client for Worker...")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-logger.info("Supabase client initialized successfully.")
+logger.info(f"Supabase client initialized successfully. WORKER_ID={WORKER_ID}")
 
 # --- 2. 辅助函数：文件树构建和上传 ---
 
@@ -1264,7 +1267,7 @@ def find_and_process_job():
 
     job = response.data[0]
     job_id = job['id']
-    logger.info(f"Claimed job {job_id} via claim_next_job() RPC. Processing...")
+    logger.info(f"[{WORKER_ID}] Claimed job {job_id} via claim_next_job() RPC. Processing...")
 
     # --- Controlled pipeline mode: MCP stage-by-stage ---
     pipeline_mode = job.get('pipeline_mode', 'auto')
@@ -1421,7 +1424,7 @@ def main_loop():
     # Pre-start MCP server so the first controlled-pipeline job doesn't wait
     _warmup_mcp_server()
 
-    logger.info("Worker started. Looking for jobs...")
+    logger.info(f"[{WORKER_ID}] Worker started. Looking for jobs...")
     while True:
         try:
             # Purge cycle: auto-expire old tasks + hard-delete expired soft-deleted (throttled internally)
