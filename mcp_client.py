@@ -62,12 +62,17 @@ class MCPServerManager:
             f"--transport http --host {self.host} --port {self.port}"
         )
 
+        # Build sanitized env — exclude server-side secrets from subprocess
+        from worker import _build_subprocess_env
+        clean_env = _build_subprocess_env()
+
         logger.info("Starting MCP server: %s", server_cmd)
         self._process = subprocess.Popen(
             ["bash", "-c", server_cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
+            env=clean_env,
         )
 
         # Wait for server to be ready by trying a TCP connection

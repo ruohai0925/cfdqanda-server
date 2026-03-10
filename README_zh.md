@@ -149,6 +149,8 @@ docker compose up -d --scale worker=3
 | `WORKER_ID` | 否 | Worker 唯一标识（默认 `worker-{PID}`），多 Worker 部署时用于区分日志 |
 | `HEALTH_CHECK_PORT` | 否 | Worker 健康检查 HTTP 端口，默认 `8001`。设为 `0` 禁用 |
 | `WORKER_HEALTH_URL` | 否 | Worker 健康检查 URL，供管理状态端点使用。默认 `http://localhost:8001/health`；Docker 中自动设为 `http://worker:8001/health` |
+| `USER_STORAGE_LIMIT_MB` | 否 | 每用户最大云端存储（MB），默认 `2048`（2 GB） |
+| `USER_DAILY_TASK_LIMIT` | 否 | 每用户每日最大任务提交数，默认 `10`（UTC 零点重置） |
 
 ## 工作流程
 

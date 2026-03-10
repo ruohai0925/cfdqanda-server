@@ -36,6 +36,10 @@ _io_executor = ThreadPoolExecutor(max_workers=4)
 # Docker Compose: http://worker:8001/health; bare metal: http://localhost:8001/health
 WORKER_HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://localhost:8001/health")
 
+# --- User quota configuration ---
+USER_STORAGE_LIMIT_BYTES = int(os.environ.get("USER_STORAGE_LIMIT_MB", "2048")) * 1024 * 1024  # default 2 GB
+USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "10"))  # default 10 tasks/day
+
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
 if not FOAM_AGENT_DIR:
@@ -165,6 +169,37 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
     """
     logger.info(f"Received new simulation request for user: {user_id}")
     try:
+        # --- Quota checks ---
+
+        # 1. Daily task limit (count tasks created today by this user)
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        today_resp = (
+            supabase.table('simulations')
+            .select('id', count='exact')
+            .eq('user_id', user_id)
+            .gte('created_at', today_start)
+            .execute()
+        )
+        today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
+        if today_count >= USER_DAILY_TASK_LIMIT:
+            logger.warning(f"User {user_id} hit daily task limit ({today_count}/{USER_DAILY_TASK_LIMIT})")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily task limit reached ({USER_DAILY_TASK_LIMIT} tasks/day). Please try again tomorrow."
+            )
+
+        # 2. Storage quota (reuse cached storage calculation)
+        storage_total = _get_user_storage_bytes(user_id)
+        if storage_total >= USER_STORAGE_LIMIT_BYTES:
+            logger.warning(f"User {user_id} exceeded storage quota ({_format_bytes(storage_total)} / {_format_bytes(USER_STORAGE_LIMIT_BYTES)})")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Storage quota exceeded ({_format_bytes(storage_total)} / {_format_bytes(USER_STORAGE_LIMIT_BYTES)}). "
+                       f"Please delete old tasks to free space."
+            )
+
         # 构建插入数据
         insert_data = {
             'prompt': sim_request.prompt,
@@ -200,9 +235,10 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
             logger.error(f"Failed to insert task into database: {error_message}")
             raise HTTPException(status_code=500, detail=f"Failed to insert task into database: {error_message}")
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        # 捕获任何其他异常，并返回一个服务器内部错误
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 # --- 4. (可选) 创建一个根端点用于测试 ---
@@ -448,6 +484,9 @@ async def soft_delete_simulation(job_id: str, user_id: str = Depends(verify_jwt)
             {'deleted_at': datetime.now(timezone.utc).isoformat()}
         ).eq('id', job_id).execute()
 
+        # Invalidate storage cache so quota check reflects the deletion
+        _storage_cache.pop(user_id, None)
+
         logger.info(f"Soft-deleted simulation {job_id} by user {user_id}")
         return {"status": "success", "message": f"Simulation {job_id} deleted"}
 
@@ -638,6 +677,9 @@ async def restore_simulation(job_id: str, user_id: str = Depends(verify_jwt)):
             {'deleted_at': None}
         ).eq('id', job_id).execute()
 
+        # Invalidate storage cache (restored task re-counts toward quota)
+        _storage_cache.pop(user_id, None)
+
         logger.info(f"Restored simulation {job_id} by user {user_id}")
         return {"status": "success", "message": f"Simulation {job_id} restored"}
 
@@ -690,6 +732,40 @@ def _get_storage_dir_size(prefix: str) -> int:
 # In-memory cache: { user_id: { "result": {...}, "expires": timestamp } }
 _storage_cache = {}
 _STORAGE_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_user_storage_bytes(user_id: str) -> int:
+    """
+    Return total storage bytes for a user. Uses cache when available.
+    Called by both the storage endpoint and the quota check in create_simulation_task.
+    """
+    cached = _storage_cache.get(user_id)
+    if cached and time.time() < cached["expires"]:
+        return cached["result"]["total_bytes"]
+
+    try:
+        response = (
+            supabase.table('simulations')
+            .select('id, result_data')
+            .eq('user_id', user_id)
+            .is_('deleted_at', 'null')
+            .execute()
+        )
+        total = 0
+        for row in response.data:
+            rd = row.get('result_data') or {}
+            stats = rd.get('upload_stats') or {}
+            recorded = stats.get('total_bytes')
+            if recorded is not None and recorded > 0:
+                total += recorded
+            else:
+                storage_base = rd.get('storage_base_path')
+                if storage_base:
+                    total += _get_storage_dir_size(storage_base)
+        return total
+    except Exception as e:
+        logger.error(f"Error computing storage for quota check: {e}")
+        return 0  # fail open: allow submission if storage check fails
 
 
 @app.get("/api/v1/user/storage")

@@ -128,6 +128,8 @@ docker compose up -d --scale worker=3
 | `WORKER_ID` | No | `worker-{PID}` | Unique identifier for multi-worker setups |
 | `HEALTH_CHECK_PORT` | No | `8001` | Worker health check HTTP port (set to `0` to disable) |
 | `WORKER_HEALTH_URL` | No | `http://localhost:8001/health` | Worker health URL for admin status endpoint (Docker: `http://worker:8001/health`) |
+| `USER_STORAGE_LIMIT_MB` | No | `2048` | Max cloud storage per user in MB (2 GB default) |
+| `USER_DAILY_TASK_LIMIT` | No | `10` | Max tasks a user can submit per day (UTC midnight reset) |
 
 ## How It Works
 

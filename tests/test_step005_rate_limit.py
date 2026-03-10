@@ -72,15 +72,39 @@ def app_client():
 
 
 def _mock_supabase_insert_success(mock_supabase):
-    """Configure mock Supabase to return a successful insert."""
-    mock_response = MagicMock()
-    mock_response.data = [{
+    """Configure mock Supabase to pass quota checks and return a successful insert.
+
+    The create_simulation_task endpoint runs 3 sequential queries via supabase.table():
+    1. Daily task count: select('id', count='exact').eq().gte().execute() → count=0
+    2. Storage usage:    select('result_data').eq().is_().execute() → data=[]
+    3. Insert:           insert({...}).execute() → data=[{...}]
+
+    We set up each mock chain independently so it works for any number of requests.
+    """
+    mock_table = MagicMock()
+
+    # Daily task count query chain
+    daily_resp = MagicMock()
+    daily_resp.count = 0
+    daily_resp.data = []
+    mock_table.select.return_value.eq.return_value.gte.return_value.execute.return_value = daily_resp
+
+    # Storage usage query chain
+    storage_resp = MagicMock()
+    storage_resp.data = []
+    mock_table.select.return_value.eq.return_value.is_.return_value.execute.return_value = storage_resp
+
+    # Insert chain
+    insert_resp = MagicMock()
+    insert_resp.data = [{
         "id": "fake-job-id",
         "user_id": TEST_USER_ID,
         "prompt": "test simulation",
         "status": "queued",
     }]
-    mock_supabase.table.return_value.insert.return_value.execute.return_value = mock_response
+    mock_table.insert.return_value.execute.return_value = insert_resp
+
+    mock_supabase.table.return_value = mock_table
 
 
 # --- Tests: Rate limiting on POST /api/v1/simulations ---
@@ -90,7 +114,8 @@ class TestSimulationRateLimit:
 
     def test_within_limit_succeeds(self, app_client):
         """5 requests within the limit should all succeed."""
-        client, mock_supabase, _ = app_client
+        client, mock_supabase, api_server_mod = app_client
+        api_server_mod._storage_cache.clear()
         _mock_supabase_insert_success(mock_supabase)
         token = create_test_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -105,7 +130,8 @@ class TestSimulationRateLimit:
 
     def test_exceeding_limit_returns_429(self, app_client):
         """6th request within a minute should return 429."""
-        client, mock_supabase, _ = app_client
+        client, mock_supabase, api_server_mod = app_client
+        api_server_mod._storage_cache.clear()
         _mock_supabase_insert_success(mock_supabase)
         token = create_test_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -207,7 +233,8 @@ class TestRateLimitResponse:
 
     def test_429_response_body(self, app_client):
         """429 response should include an error message."""
-        client, mock_supabase, _ = app_client
+        client, mock_supabase, api_server_mod = app_client
+        api_server_mod._storage_cache.clear()
         _mock_supabase_insert_success(mock_supabase)
         token = create_test_token()
         headers = {"Authorization": f"Bearer {token}"}

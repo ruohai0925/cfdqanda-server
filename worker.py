@@ -8,6 +8,7 @@ import signal
 import json
 import shutil
 import threading
+import fnmatch
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -84,6 +85,75 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 logger.info("Initializing Supabase client for Worker...")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 logger.info(f"Supabase client initialized successfully. WORKER_ID={WORKER_ID}")
+
+# --- Security: subprocess environment and log sanitization ---
+
+# Server-side env vars that must NOT be passed to Foam-Agent subprocess.
+# The subprocess only needs: system vars, OpenFOAM vars, and LLM credentials.
+_SUBPROCESS_ENV_BLOCKLIST = frozenset({
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_KEY',
+    'SUPABASE_JWT_SECRET',
+    'EXTRA_CORS_ORIGINS',
+    'WORKER_ID',
+    'HEALTH_CHECK_PORT',
+    'WORKER_HEALTH_URL',
+    'USER_STORAGE_LIMIT_MB',
+    'USER_DAILY_TASK_LIMIT',
+    'FOAM_AGENT_HOST_PATH',
+    'MIDDLEWARE_HOST_PATH',
+    'MIDDLEWARE_DIR',
+    'SIMULATION_TIMEOUT',
+    'STALE_JOB_THRESHOLD',
+    'MCP_SERVER_PORT',
+})
+
+# Patterns to redact from simulation.log before uploading to user-accessible storage
+_SENSITIVE_LOG_PATTERNS = [
+    (re.compile(r'sk-proj-[A-Za-z0-9_-]{20,}'), '[REDACTED_OPENAI_KEY]'),
+    (re.compile(r'sk-ant-[A-Za-z0-9_-]{20,}'), '[REDACTED_ANTHROPIC_KEY]'),
+    # Generic sk- keys (OpenAI legacy format, 40+ chars to avoid false positives)
+    (re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9]{40,}'), '[REDACTED_API_KEY]'),
+    # JWT tokens (three dot-separated base64 segments, e.g. Supabase service key)
+    (re.compile(r'eyJ[A-Za-z0-9_/+-]{50,}\.[A-Za-z0-9_/+-]{50,}\.[A-Za-z0-9_/+-]{20,}'),
+     '[REDACTED_TOKEN]'),
+]
+
+
+def _build_subprocess_env():
+    """Build a sanitized environment dict for simulation subprocesses.
+
+    Starts from the current process environment and removes server-side secrets
+    (Supabase credentials, worker config, etc.) so that the subprocess cannot
+    read or leak them.
+    """
+    return {k: v for k, v in os.environ.items() if k not in _SUBPROCESS_ENV_BLOCKLIST}
+
+
+def _sanitize_log_file(log_path):
+    """Redact sensitive patterns (API keys, JWT tokens) from a log file in-place.
+
+    Called before uploading simulation.log to user-accessible Supabase Storage
+    to prevent accidental credential exposure through subprocess output.
+    """
+    if not log_path or not os.path.isfile(log_path):
+        return
+    try:
+        with open(log_path, 'r', errors='replace') as f:
+            content = f.read()
+        redacted = False
+        for pattern, replacement in _SENSITIVE_LOG_PATTERNS:
+            new_content = pattern.sub(replacement, content)
+            if new_content != content:
+                redacted = True
+                content = new_content
+        if redacted:
+            with open(log_path, 'w') as f:
+                f.write(content)
+            logger.warning(f"Sanitized sensitive patterns from {log_path}")
+    except Exception as e:
+        logger.warning(f"Failed to sanitize log file {log_path}: {e}")
+
 
 # --- 2. 辅助函数：文件树构建和上传 ---
 
@@ -602,6 +672,9 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
         extra_result: Additional dict entries to merge into result_data.
         extra_fields: Additional DB columns to set (e.g. pipeline_stage).
     """
+    # Sanitize simulation.log before uploading to prevent credential leaks
+    if run_dir:
+        _sanitize_log_file(os.path.join(run_dir, "simulation.log"))
     result_data = {'error': error_msg}
     if extra_result:
         result_data.update(extra_result)
@@ -669,6 +742,9 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
                     Defaults to run_dir.  Controlled pipeline passes case_dir
                     here because the generated OpenFOAM files live outside run_dir.
     """
+    # Sanitize simulation.log before uploading to prevent credential leaks
+    _sanitize_log_file(os.path.join(run_dir, "simulation.log"))
+
     if upload_dir is None:
         upload_dir = run_dir
     storage_base_path = f"public/{user_id}/{job_id}"
@@ -1307,7 +1383,7 @@ def find_and_process_job():
 
     # Read user LLM config and build subprocess environment
     llm_config = job.get('llm_config') or {}
-    child_env = os.environ.copy()
+    child_env = _build_subprocess_env()
     temp_codex_dir = None  # Track temp dir for cleanup
 
     # Inject user-provided API key
@@ -1358,8 +1434,8 @@ def find_and_process_job():
 
     try:
         # Set env vars for Foam-Agent's Config.__post_init__() to read natively
-        effective_provider = llm_config.get('model_provider') or 'openai-codex'
-        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+        effective_provider = llm_config.get('model_provider') or 'openai'
+        effective_version = llm_config.get('model_version') or 'gpt-4o-mini'
         child_env['FOAMAGENT_MODEL_PROVIDER'] = effective_provider
         child_env['FOAMAGENT_MODEL_VERSION'] = effective_version
         child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
