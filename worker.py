@@ -966,6 +966,31 @@ def _handle_controlled_pipeline(job):
 
     logger.info(f"Job {job_id}: controlled pipeline, stage={pipeline_stage}")
 
+    # Write task_settings.json for new jobs (first stage entry only)
+    if pipeline_stage is None:
+        llm_config = job.get('llm_config') or {}
+        run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
+        os.makedirs(run_dir, exist_ok=True)
+        task_settings = {
+            'job_id': str(job_id),
+            'user_id': job.get('user_id'),
+            'created_at': job.get('created_at'),
+            'model_provider': llm_config.get('model_provider') or 'openai',
+            'model_version': llm_config.get('model_version') or 'gpt-4o-mini',
+            'has_user_api_key': bool(llm_config.get('api_key')),
+            'has_codex_token': bool(llm_config.get('codex_token')),
+            'base_url': llm_config.get('base_url'),
+            'pipeline_mode': 'controlled',
+            'pre_run_end_time': job.get('pre_run_end_time'),
+            'checkpoints': active_checkpoints,
+            'worker_id': WORKER_ID,
+        }
+        try:
+            with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
+                json.dump(task_settings, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"Job {job_id}: failed to write task_settings.json: {e}")
+
     try:
         # Ensure MCP server is running
         _ensure_mcp_server()
@@ -1431,6 +1456,28 @@ def find_and_process_job():
 
     output_path = os.path.join(run_dir, "output")
     log_path = os.path.join(run_dir, "simulation.log")
+
+    # Write task_settings.json — records all non-secret settings for post-hoc analysis.
+    # Uploaded to Supabase Storage alongside other run files.
+    task_settings = {
+        'job_id': str(job_id),
+        'user_id': job.get('user_id'),
+        'created_at': job.get('created_at'),
+        'model_provider': llm_config.get('model_provider') or 'openai',
+        'model_version': llm_config.get('model_version') or 'gpt-4o-mini',
+        'has_user_api_key': bool(llm_config.get('api_key')),
+        'has_codex_token': bool(llm_config.get('codex_token')),
+        'base_url': llm_config.get('base_url'),
+        'pipeline_mode': job.get('pipeline_mode', 'auto'),
+        'pre_run_end_time': job.get('pre_run_end_time'),
+        'checkpoints': (job.get('pipeline_state') or {}).get('active_checkpoints'),
+        'worker_id': WORKER_ID,
+    }
+    try:
+        with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
+            json.dump(task_settings, f, indent=2, default=str)
+    except Exception as e:
+        logger.warning(f"Job {job_id}: failed to write task_settings.json: {e}")
 
     try:
         # Set env vars for Foam-Agent's Config.__post_init__() to read natively
