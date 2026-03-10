@@ -112,8 +112,8 @@ _SUBPROCESS_ENV_BLOCKLIST = frozenset({
 _SENSITIVE_LOG_PATTERNS = [
     (re.compile(r'sk-proj-[A-Za-z0-9_-]{20,}'), '[REDACTED_OPENAI_KEY]'),
     (re.compile(r'sk-ant-[A-Za-z0-9_-]{20,}'), '[REDACTED_ANTHROPIC_KEY]'),
-    # Generic sk- keys (OpenAI legacy format, 40+ chars to avoid false positives)
-    (re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9]{40,}'), '[REDACTED_API_KEY]'),
+    # Generic sk- keys (OpenAI/DeepSeek format, 30+ chars to catch all variants)
+    (re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9]{30,}'), '[REDACTED_API_KEY]'),
     # JWT tokens (three dot-separated base64 segments, e.g. Supabase service key)
     (re.compile(r'eyJ[A-Za-z0-9_/+-]{50,}\.[A-Za-z0-9_/+-]{50,}\.[A-Za-z0-9_/+-]{20,}'),
      '[REDACTED_TOKEN]'),
@@ -1410,7 +1410,7 @@ def find_and_process_job():
         logger.info(f"Job {job_id}: wrote Codex OAuth token to {auth_json_path}")
 
     # Immediately clear sensitive tokens from DB (privacy)
-    sensitive_keys = {'api_key', 'codex_token'}
+    sensitive_keys = {'api_key', 'codex_token', 'base_url'}
     if any(llm_config.get(k) for k in sensitive_keys):
         try:
             safe_config = {k: v for k, v in llm_config.items() if k not in sensitive_keys}
@@ -1436,6 +1436,17 @@ def find_and_process_job():
         # Set env vars for Foam-Agent's Config.__post_init__() to read natively
         effective_provider = llm_config.get('model_provider') or 'openai'
         effective_version = llm_config.get('model_version') or 'gpt-4o-mini'
+
+        # OpenAI-compatible providers (DeepSeek, Qwen): map to 'openai' for Foam-Agent
+        # and set OPENAI_API_BASE so LangChain's ChatOpenAI routes to the correct endpoint.
+        base_url = llm_config.get('base_url')
+        if base_url:
+            child_env['OPENAI_API_BASE'] = base_url
+            logger.info(f"Job {job_id}: OPENAI_API_BASE={base_url}")
+        if effective_provider in ('deepseek', 'qwen'):
+            logger.info(f"Job {job_id}: mapping provider '{effective_provider}' → 'openai' (OpenAI-compatible)")
+            effective_provider = 'openai'
+
         child_env['FOAMAGENT_MODEL_PROVIDER'] = effective_provider
         child_env['FOAMAGENT_MODEL_VERSION'] = effective_version
         child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
