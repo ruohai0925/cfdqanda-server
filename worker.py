@@ -976,7 +976,7 @@ def _handle_controlled_pipeline(job):
             'user_id': job.get('user_id'),
             'created_at': job.get('created_at'),
             'model_provider': llm_config.get('model_provider') or 'openai',
-            'model_version': llm_config.get('model_version') or 'gpt-4o-mini',
+            'model_version': llm_config.get('model_version') or 'gpt-4.1-nano',
             'has_user_api_key': bool(llm_config.get('api_key')),
             'has_codex_token': bool(llm_config.get('codex_token')),
             'base_url': llm_config.get('base_url'),
@@ -1464,7 +1464,7 @@ def find_and_process_job():
         'user_id': job.get('user_id'),
         'created_at': job.get('created_at'),
         'model_provider': llm_config.get('model_provider') or 'openai',
-        'model_version': llm_config.get('model_version') or 'gpt-4o-mini',
+        'model_version': llm_config.get('model_version') or 'gpt-4.1-nano',
         'has_user_api_key': bool(llm_config.get('api_key')),
         'has_codex_token': bool(llm_config.get('codex_token')),
         'base_url': llm_config.get('base_url'),
@@ -1482,7 +1482,7 @@ def find_and_process_job():
     try:
         # Set env vars for Foam-Agent's Config.__post_init__() to read natively
         effective_provider = llm_config.get('model_provider') or 'openai'
-        effective_version = llm_config.get('model_version') or 'gpt-4o-mini'
+        effective_version = llm_config.get('model_version') or 'gpt-4.1-nano'
 
         # OpenAI-compatible providers (DeepSeek, Qwen): map to 'openai' for Foam-Agent
         # and set OPENAI_API_BASE so LangChain's ChatOpenAI routes to the correct endpoint.
