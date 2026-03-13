@@ -155,6 +155,50 @@ def _sanitize_log_file(log_path):
         logger.warning(f"Failed to sanitize log file {log_path}: {e}")
 
 
+def _diagnose_subprocess_failure(log_path, effective_provider):
+    """Scan simulation log for known error patterns and return a user-friendly message.
+
+    Returns a tuple (user_message, error_category) or (None, None) if no known
+    pattern is detected.
+    """
+    if not log_path or not os.path.isfile(log_path):
+        return None, None
+    try:
+        with open(log_path, 'r', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        return None, None
+
+    lower = content.lower()
+
+    # Rate limit / quota exceeded (OpenAI, Codex, Anthropic, DeepSeek)
+    if any(p in lower for p in [
+        'rate_limit_exceeded', 'ratelimiterror', 'rate limit reached',
+        'too many requests', 'quota exceeded', 'insufficient_quota',
+        'you exceeded your current quota',
+    ]):
+        if effective_provider == 'openai-codex':
+            return (
+                "Platform Codex shared quota exceeded. "
+                "Please try again later, or switch to another model."
+            ), 'codex_quota_exceeded'
+        return (
+            "LLM API rate limit or quota exceeded. "
+            "Please try again later, or use a different API key / model."
+        ), 'rate_limit'
+
+    # Authentication errors
+    if any(p in lower for p in [
+        'authentication', 'invalid api key', 'invalid_api_key',
+        'incorrect api key', 'unauthorized', '401',
+    ]):
+        return (
+            "LLM API authentication failed. Please check your API key."
+        ), 'auth_error'
+
+    return None, None
+
+
 # --- 2. 辅助函数：文件树构建和上传 ---
 
 def build_file_tree(directory_path):
@@ -1537,11 +1581,22 @@ def find_and_process_job():
             )
         else:
             logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
+            # Diagnose known error patterns from log
+            user_msg, err_cat = _diagnose_subprocess_failure(log_path, effective_provider)
+            if user_msg:
+                logger.info(f"Job {job_id}: diagnosed failure as '{err_cat}'")
+                error_msg = user_msg
+            else:
+                error_msg = f"Foam-Agent script failed with return code {returncode}."
             _upload_and_fail(
                 job_id, job['user_id'],
-                f"Foam-Agent script failed with return code {returncode}.",
+                error_msg,
                 run_dir=run_dir,
-                extra_result={'log_path_on_server': log_path, 'allrun_audit': allrun_audit},
+                extra_result={
+                    'log_path_on_server': log_path,
+                    'allrun_audit': allrun_audit,
+                    'error_category': err_cat,
+                },
             )
 
     except Exception as e:
