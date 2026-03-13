@@ -8,7 +8,7 @@ Verifies that:
 4. Unknown errors return (None, None).
 5. Timeout failures include error_category='timeout' and human-readable duration.
 6. GET /api/v1/queue-status returns correct queue depth and ordered job IDs.
-7. Platform default model is gpt-4.1-nano (not gpt-4o-mini).
+7. Platform default model is gpt-5-nano (not gpt-4o-mini).
 """
 
 import os
@@ -106,7 +106,7 @@ class TestDiagnoseSubprocessFailure:
     def test_openai_rate_limit(self):
         """OpenAI rate limit with provider='openai' → error_category='rate_limit'."""
         log = self._write_log(
-            "openai.RateLimitError: Rate limit reached for gpt-4.1-nano "
+            "openai.RateLimitError: Rate limit reached for gpt-5-nano "
             "in organization org-xxx on requests per min."
         )
         msg, cat = self.diagnose(log, 'openai')
@@ -201,7 +201,7 @@ class TestDiagnoseSubprocessFailure:
 
     def test_case_insensitive_detection(self):
         """Detection is case-insensitive."""
-        log = self._write_log("RATELIMITERROR: RATE LIMIT REACHED for model gpt-4.1-nano")
+        log = self._write_log("RATELIMITERROR: RATE LIMIT REACHED for model gpt-5-nano")
         msg, cat = self.diagnose(log, 'openai')
         assert cat == 'rate_limit'
         os.unlink(log)
@@ -260,19 +260,19 @@ class TestTimeoutErrorCategory:
 
 
 # ---------------------------------------------------------------------------
-# Part 3: Platform default model = gpt-4.1-nano
+# Part 3: Platform default model = gpt-5-nano
 # ---------------------------------------------------------------------------
 
 class TestPlatformDefaultModel:
-    """Verify the platform default model is gpt-4.1-nano."""
+    """Verify the platform default model is gpt-5-nano."""
 
     def test_default_model_version_is_nano(self):
-        """When llm_config is empty, effective_version should be gpt-4.1-nano."""
+        """When llm_config is empty, effective_version should be gpt-5-nano."""
         # The fallback pattern in worker.py:
-        #   effective_version = llm_config.get('model_version') or 'gpt-4.1-nano'
+        #   effective_version = llm_config.get('model_version') or 'gpt-5-nano'
         llm_config = {}
-        effective_version = llm_config.get('model_version') or 'gpt-4.1-nano'
-        assert effective_version == 'gpt-4.1-nano'
+        effective_version = llm_config.get('model_version') or 'gpt-5-nano'
+        assert effective_version == 'gpt-5-nano'
 
     def test_default_model_provider_is_openai(self):
         """When llm_config is empty, effective_provider should be openai."""
@@ -284,7 +284,7 @@ class TestPlatformDefaultModel:
         """When llm_config has values, they override defaults."""
         llm_config = {'model_provider': 'anthropic', 'model_version': 'claude-sonnet-4-5-20250929'}
         effective_provider = llm_config.get('model_provider') or 'openai'
-        effective_version = llm_config.get('model_version') or 'gpt-4.1-nano'
+        effective_version = llm_config.get('model_version') or 'gpt-5-nano'
         assert effective_provider == 'anthropic'
         assert effective_version == 'claude-sonnet-4-5-20250929'
 
