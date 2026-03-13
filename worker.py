@@ -669,9 +669,16 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path, cancelled, 
         return True
 
     if timed_out:
-        _upload_and_fail(job_id, user_id, 'Simulation timed out.',
-                         run_dir=run_dir,
-                         extra_result={'log_path_on_server': log_path})
+        timeout_min = SIMULATION_TIMEOUT // 60
+        _upload_and_fail(
+            job_id, user_id,
+            f'Simulation timed out after {timeout_min} minutes.',
+            run_dir=run_dir,
+            extra_result={
+                'log_path_on_server': log_path,
+                'error_category': 'timeout',
+            },
+        )
         return True
 
     return False
