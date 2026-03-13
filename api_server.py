@@ -251,6 +251,37 @@ def read_root():
     return {"message": "Foam-Agent API Server is running!"}
 
 
+# --- Queue status endpoint ---
+
+@app.get("/api/v1/queue-status")
+async def get_queue_status():
+    """Return current queue depth and ordered list of queued job IDs.
+
+    Used by the frontend to show queue position for waiting tasks.
+    No auth required — only returns job IDs and counts, no sensitive data.
+    """
+    try:
+        queued = supabase.table('simulations') \
+            .select('id, created_at') \
+            .eq('status', 'queued') \
+            .is_('deleted_at', None) \
+            .order('created_at', desc=False) \
+            .execute()
+        running = supabase.table('simulations') \
+            .select('id') \
+            .eq('status', 'running') \
+            .is_('deleted_at', None) \
+            .execute()
+        return {
+            "queued_count": len(queued.data),
+            "running_count": len(running.data),
+            "queued_ids": [str(j["id"]) for j in queued.data],
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch queue status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch queue status")
+
+
 # --- 5. 文件浏览相关端点（可选，用于前端快速获取文件树）---
 
 @app.get("/api/v1/simulations/{job_id}/files")
