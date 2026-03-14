@@ -8,7 +8,7 @@ Verifies that:
 4. Unknown errors return (None, None).
 5. Timeout failures include error_category='timeout' and human-readable duration.
 6. GET /api/v1/queue-status returns correct queue depth and ordered job IDs.
-7. Platform default model is gpt-5-mini (not gpt-4o-mini).
+7. Platform default model is gpt-5.3-codex (openai-codex provider).
 """
 
 import os
@@ -106,7 +106,7 @@ class TestDiagnoseSubprocessFailure:
     def test_openai_rate_limit(self):
         """OpenAI rate limit with provider='openai' → error_category='rate_limit'."""
         log = self._write_log(
-            "openai.RateLimitError: Rate limit reached for gpt-5-mini "
+            "openai.RateLimitError: Rate limit reached for gpt-5.3-codex "
             "in organization org-xxx on requests per min."
         )
         msg, cat = self.diagnose(log, 'openai')
@@ -201,7 +201,7 @@ class TestDiagnoseSubprocessFailure:
 
     def test_case_insensitive_detection(self):
         """Detection is case-insensitive."""
-        log = self._write_log("RATELIMITERROR: RATE LIMIT REACHED for model gpt-5-mini")
+        log = self._write_log("RATELIMITERROR: RATE LIMIT REACHED for model gpt-5.3-codex")
         msg, cat = self.diagnose(log, 'openai')
         assert cat == 'rate_limit'
         os.unlink(log)
@@ -274,31 +274,31 @@ class TestTimeoutErrorCategory:
 
 
 # ---------------------------------------------------------------------------
-# Part 3: Platform default model = gpt-5-mini
+# Part 3: Platform default model = openai-codex / gpt-5.3-codex
 # ---------------------------------------------------------------------------
 
 class TestPlatformDefaultModel:
-    """Verify the platform default model is gpt-5-mini."""
+    """Verify the platform default model is openai-codex / gpt-5.3-codex."""
 
     def test_default_model_version_is_nano(self):
-        """When llm_config is empty, effective_version should be gpt-5-mini."""
+        """When llm_config is empty, effective_version should be gpt-5.3-codex."""
         # The fallback pattern in worker.py:
-        #   effective_version = llm_config.get('model_version') or 'gpt-5-mini'
+        #   effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
         llm_config = {}
-        effective_version = llm_config.get('model_version') or 'gpt-5-mini'
-        assert effective_version == 'gpt-5-mini'
+        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+        assert effective_version == 'gpt-5.3-codex'
 
-    def test_default_model_provider_is_openai(self):
-        """When llm_config is empty, effective_provider should be openai."""
+    def test_default_model_provider_is_codex(self):
+        """When llm_config is empty, effective_provider should be openai-codex."""
         llm_config = {}
-        effective_provider = llm_config.get('model_provider') or 'openai'
-        assert effective_provider == 'openai'
+        effective_provider = llm_config.get('model_provider') or 'openai-codex'
+        assert effective_provider == 'openai-codex'
 
     def test_byok_overrides_default(self):
         """When llm_config has values, they override defaults."""
         llm_config = {'model_provider': 'anthropic', 'model_version': 'claude-sonnet-4-5-20250929'}
-        effective_provider = llm_config.get('model_provider') or 'openai'
-        effective_version = llm_config.get('model_version') or 'gpt-5-mini'
+        effective_provider = llm_config.get('model_provider') or 'openai-codex'
+        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
         assert effective_provider == 'anthropic'
         assert effective_version == 'claude-sonnet-4-5-20250929'
 
