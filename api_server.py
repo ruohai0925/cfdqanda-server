@@ -38,7 +38,7 @@ WORKER_HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://localhost:8001/h
 
 # --- User quota configuration ---
 USER_STORAGE_LIMIT_BYTES = int(os.environ.get("USER_STORAGE_LIMIT_MB", "2048")) * 1024 * 1024  # default 2 GB
-USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "10"))  # default 10 tasks/day
+USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "5"))  # default 5 tasks/day
 
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
@@ -249,6 +249,33 @@ def read_root():
     一个简单的"健康检查"端点，用于确认服务器是否正在运行。
     """
     return {"message": "Foam-Agent API Server is running!"}
+
+
+# --- Daily usage endpoint ---
+
+@app.get("/api/v1/user/daily-usage")
+async def get_daily_usage(user_id: str = Depends(verify_jwt)):
+    """Return the user's daily task usage and limit."""
+    try:
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        today_resp = (
+            supabase.table('simulations')
+            .select('id', count='exact')
+            .eq('user_id', user_id)
+            .gte('created_at', today_start)
+            .execute()
+        )
+        today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
+        return {
+            "used": today_count,
+            "limit": USER_DAILY_TASK_LIMIT,
+            "remaining": max(0, USER_DAILY_TASK_LIMIT - today_count),
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch daily usage: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch daily usage")
 
 
 # --- Queue status endpoint ---

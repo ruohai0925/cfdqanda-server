@@ -660,7 +660,7 @@ class TestMCPStageInputWriter(unittest.TestCase):
     """Test _mcp_stage_input_writer checkpoint and auto-continue behavior."""
 
     @patch('worker._append_mcp_log')
-    @patch('worker.upload_directory_to_storage', return_value=(5, 0))
+    @patch('worker.upload_directory_to_storage', return_value=(5, 0, 1024))
     @patch('worker.build_file_tree', return_value={'name': 'root'})
     @patch('worker._update_pipeline_state')
     @patch('worker._get_mcp_server_manager')
