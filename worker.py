@@ -188,9 +188,11 @@ def _diagnose_subprocess_failure(log_path, effective_provider):
         ), 'rate_limit'
 
     # Authentication errors
+    # Note: avoid bare '401' — it false-matches FAISS similarity scores like 0.401...
     if any(p in lower for p in [
-        'authentication', 'invalid api key', 'invalid_api_key',
-        'incorrect api key', 'unauthorized', '401',
+        'authenticationerror', 'invalid api key', 'invalid_api_key',
+        'incorrect api key', 'unauthorized', 'http 401', 'status 401',
+        'error code: 401', '401 unauthorized',
     ]):
         return (
             "LLM API authentication failed. Please check your API key."

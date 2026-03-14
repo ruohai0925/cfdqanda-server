@@ -206,6 +206,20 @@ class TestDiagnoseSubprocessFailure:
         assert cat == 'rate_limit'
         os.unlink(log)
 
+    def test_faiss_score_not_false_positive_auth(self):
+        """FAISS similarity score containing '401' should NOT trigger auth_error.
+
+        Regression test for bug where score=0.40114... was matched by bare '401' pattern.
+        """
+        log = self._write_log(
+            "1. cavityDrivenFlow | incompressible | RAS | pimpleFoam | score=0.40114468336105347\n"
+            "2. flowWithOpenBoundary | incompressible | laminar\n"
+            "Workflow failed with error: ValidationError"
+        )
+        msg, cat = self.diagnose(log, 'openai-codex')
+        assert cat is None, f"FAISS score should not trigger auth_error, got: {cat}"
+        os.unlink(log)
+
 
 # ---------------------------------------------------------------------------
 # Part 2: Timeout error_category test
