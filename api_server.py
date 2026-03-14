@@ -38,7 +38,7 @@ WORKER_HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://localhost:8001/h
 
 # --- User quota configuration ---
 USER_STORAGE_LIMIT_BYTES = int(os.environ.get("USER_STORAGE_LIMIT_MB", "2048")) * 1024 * 1024  # default 2 GB
-USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "5"))  # default 5 tasks/day
+USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "10"))  # default 10 tasks/day
 # Admin emails exempt from daily task limit (comma-separated)
 _QUOTA_EXEMPT_EMAILS = set(
     e.strip().lower() for e in os.environ.get("QUOTA_EXEMPT_EMAILS", "").split(",") if e.strip()

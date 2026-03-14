@@ -179,8 +179,8 @@ def _diagnose_subprocess_failure(log_path, effective_provider):
     ]):
         if effective_provider == 'openai-codex':
             return (
-                "Platform Codex shared quota exceeded. "
-                "Please try again later, or switch to another model."
+                "Platform Codex quota temporarily exhausted. "
+                "It resets every few hours — please wait and try again, or use BYOK with your own API key."
             ), 'codex_quota_exceeded'
         return (
             "LLM API rate limit or quota exceeded. "
