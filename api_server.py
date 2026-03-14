@@ -39,6 +39,10 @@ WORKER_HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://localhost:8001/h
 # --- User quota configuration ---
 USER_STORAGE_LIMIT_BYTES = int(os.environ.get("USER_STORAGE_LIMIT_MB", "2048")) * 1024 * 1024  # default 2 GB
 USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "5"))  # default 5 tasks/day
+# Admin emails exempt from daily task limit (comma-separated)
+_QUOTA_EXEMPT_EMAILS = set(
+    e.strip().lower() for e in os.environ.get("QUOTA_EXEMPT_EMAILS", "").split(",") if e.strip()
+)
 
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
@@ -172,23 +176,39 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
         # --- Quota checks ---
 
         # 1. Daily task limit (count tasks created today by this user)
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).isoformat()
-        today_resp = (
-            supabase.table('simulations')
-            .select('id', count='exact')
-            .eq('user_id', user_id)
-            .gte('created_at', today_start)
-            .execute()
-        )
-        today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
-        if today_count >= USER_DAILY_TASK_LIMIT:
-            logger.warning(f"User {user_id} hit daily task limit ({today_count}/{USER_DAILY_TASK_LIMIT})")
-            raise HTTPException(
-                status_code=429,
-                detail=f"Daily task limit reached ({USER_DAILY_TASK_LIMIT} tasks/day). Please try again tomorrow."
+        # Check if user is exempt (admin/test accounts)
+        is_exempt = False
+        if _QUOTA_EXEMPT_EMAILS:
+            try:
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.startswith("Bearer "):
+                    token_payload = jwt.decode(
+                        auth_header[7:], SUPABASE_JWT_SECRET,
+                        algorithms=["HS256"], audience="authenticated"
+                    )
+                    user_email = token_payload.get("email", "").lower()
+                    is_exempt = user_email in _QUOTA_EXEMPT_EMAILS
+            except Exception:
+                pass  # if decode fails, not exempt
+
+        if not is_exempt:
+            today_start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            today_resp = (
+                supabase.table('simulations')
+                .select('id', count='exact')
+                .eq('user_id', user_id)
+                .gte('created_at', today_start)
+                .execute()
             )
+            today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
+            if today_count >= USER_DAILY_TASK_LIMIT:
+                logger.warning(f"User {user_id} hit daily task limit ({today_count}/{USER_DAILY_TASK_LIMIT})")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Daily task limit reached ({USER_DAILY_TASK_LIMIT} tasks/day). Please try again tomorrow."
+                )
 
         # 2. Storage quota (reuse cached storage calculation)
         storage_total = _get_user_storage_bytes(user_id)
@@ -254,9 +274,23 @@ def read_root():
 # --- Daily usage endpoint ---
 
 @app.get("/api/v1/user/daily-usage")
-async def get_daily_usage(user_id: str = Depends(verify_jwt)):
+async def get_daily_usage(request: Request, user_id: str = Depends(verify_jwt)):
     """Return the user's daily task usage and limit."""
     try:
+        # Check if user is exempt
+        is_exempt = False
+        if _QUOTA_EXEMPT_EMAILS:
+            try:
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.startswith("Bearer "):
+                    token_payload = jwt.decode(
+                        auth_header[7:], SUPABASE_JWT_SECRET,
+                        algorithms=["HS256"], audience="authenticated"
+                    )
+                    is_exempt = token_payload.get("email", "").lower() in _QUOTA_EXEMPT_EMAILS
+            except Exception:
+                pass
+
         today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).isoformat()
@@ -268,10 +302,12 @@ async def get_daily_usage(user_id: str = Depends(verify_jwt)):
             .execute()
         )
         today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
+        effective_limit = 999999 if is_exempt else USER_DAILY_TASK_LIMIT
         return {
             "used": today_count,
-            "limit": USER_DAILY_TASK_LIMIT,
-            "remaining": max(0, USER_DAILY_TASK_LIMIT - today_count),
+            "limit": effective_limit,
+            "remaining": max(0, effective_limit - today_count),
+            "exempt": is_exempt,
         }
     except Exception as e:
         logger.error(f"Failed to fetch daily usage: {e}")
