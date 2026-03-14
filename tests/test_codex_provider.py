@@ -38,23 +38,23 @@ def create_test_token(user_id=TEST_USER_ID, secret=TEST_JWT_SECRET):
 # --- Worker default tests (pure logic, no server needed) ---
 
 class TestWorkerCodexDefaults:
-    """Verify worker default provider/version logic matches openai/gpt-4o-mini."""
+    """Verify worker default provider/version logic matches openai-codex/gpt-5.3-codex."""
 
-    def test_default_provider_is_openai(self):
-        """When llm_config has no model_provider, default to openai."""
+    def test_default_provider_is_codex(self):
+        """When llm_config has no model_provider, default to openai-codex."""
         llm_config = {}
-        effective_provider = llm_config.get('model_provider') or 'openai'
-        effective_version = llm_config.get('model_version') or 'gpt-4o-mini'
-        assert effective_provider == 'openai'
-        assert effective_version == 'gpt-4o-mini'
+        effective_provider = llm_config.get('model_provider') or 'openai-codex'
+        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+        assert effective_provider == 'openai-codex'
+        assert effective_version == 'gpt-5.3-codex'
 
     def test_empty_llm_config_defaults(self):
-        """When llm_config is None, default to openai/gpt-4o-mini."""
+        """When llm_config is None, default to openai-codex/gpt-5.3-codex."""
         llm_config = None
-        effective_provider = (llm_config or {}).get('model_provider') or 'openai'
-        effective_version = (llm_config or {}).get('model_version') or 'gpt-4o-mini'
-        assert effective_provider == 'openai'
-        assert effective_version == 'gpt-4o-mini'
+        effective_provider = (llm_config or {}).get('model_provider') or 'openai-codex'
+        effective_version = (llm_config or {}).get('model_version') or 'gpt-5.3-codex'
+        assert effective_provider == 'openai-codex'
+        assert effective_version == 'gpt-5.3-codex'
 
     def test_user_override_openai(self):
         """When user provides model_provider=openai, it overrides the default."""
