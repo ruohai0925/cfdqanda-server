@@ -61,6 +61,16 @@ logger.info(f"Pre-run timeout set to {PRE_RUN_TIMEOUT} seconds")
 # Health check HTTP server port. Set to 0 to disable.
 HEALTH_CHECK_PORT = int(os.environ.get("HEALTH_CHECK_PORT", "8001"))
 
+# --- Controlled pipeline: exclusive worker lock ---
+# When a worker is bound to a controlled-pipeline job, it must not claim
+# other jobs until that job completes/fails/is cancelled.
+# Stores the job ID (int/str) or None.
+_bound_pipeline_job_id = None
+# Timestamp (UTC) when the bound job entered its current checkpoint.
+_bound_checkpoint_since = None
+# How long (seconds) to wait for user confirmation before auto-failing.
+CHECKPOINT_TIMEOUT = int(os.environ.get("CHECKPOINT_TIMEOUT", "1800"))  # 30 min
+
 # --- Middleware directory configuration ---
 MIDDLEWARE_DIR = os.environ.get("MIDDLEWARE_DIR")
 if MIDDLEWARE_DIR:
@@ -423,9 +433,18 @@ def recover_stale_jobs():
                 f"(updated_at: {job.get('updated_at', 'unknown')}). "
                 f"Resetting to 'queued'."
             )
-            supabase.table('simulations').update(
-                {'status': 'queued'}
+            # Clear worker affinity so any available worker can pick it up.
+            # Fetch current pipeline_state to remove assigned_worker_id.
+            full_job = supabase.table('simulations').select(
+                'pipeline_state'
             ).eq('id', job_id).execute()
+            update_data = {'status': 'queued'}
+            if full_job.data:
+                ps = full_job.data[0].get('pipeline_state') or {}
+                if ps.pop('assigned_worker_id', None):
+                    update_data['pipeline_state'] = ps
+                    logger.info(f"Stale job {job_id}: cleared worker affinity.")
+            supabase.table('simulations').update(update_data).eq('id', job_id).execute()
             logger.info(f"Stale job {job_id} reset to 'queued' successfully.")
 
     except Exception as e:
@@ -1008,7 +1027,13 @@ def _handle_controlled_pipeline(job):
     The stage transitions are driven by the DB pipeline_stage value:
     - None / new job: start from plan
     - Any *_review stage: user confirmed, continue from next stage
+
+    Worker exclusivity: once a worker starts a controlled-pipeline job, it is
+    exclusively bound to that job until completion/failure. The binding is
+    tracked via the module-level _bound_pipeline_job_id variable and the
+    pipeline_state['assigned_worker_id'] field in the DB.
     """
+    global _bound_pipeline_job_id, _bound_checkpoint_since
     import asyncio
     from mcp_client import FoamAgentMCPClient
 
@@ -1018,6 +1043,15 @@ def _handle_controlled_pipeline(job):
     active_checkpoints = pipeline_state.get('active_checkpoints', [])
 
     logger.info(f"Job {job_id}: controlled pipeline, stage={pipeline_stage}")
+
+    # --- Worker affinity: bind job to this worker on first touch ---
+    if not pipeline_state.get('assigned_worker_id'):
+        pipeline_state['assigned_worker_id'] = WORKER_ID
+        logger.info(f"Job {job_id}: assigned to {WORKER_ID}")
+
+    # --- Exclusive lock: this worker is now reserved for this job ---
+    _bound_pipeline_job_id = job_id
+    logger.info(f"Job {job_id}: worker {WORKER_ID} exclusively bound")
 
     # Write task_settings.json for new jobs (first stage entry only)
     if pipeline_stage is None:
@@ -1075,6 +1109,27 @@ def _handle_controlled_pipeline(job):
                          f"Pipeline error at stage '{pipeline_stage}': {str(e)}",
                          run_dir=run_dir,
                          extra_fields={'pipeline_stage': pipeline_stage})
+
+    # --- Check if job reached a terminal state → release the lock ---
+    # Terminal states: completed, failed, cancelled (no more stages to run).
+    # Checkpoint state: worker stays bound, waiting for user confirm.
+    try:
+        final = supabase.table('simulations').select('status').eq('id', job_id).execute()
+        final_status = final.data[0]['status'] if final.data else 'unknown'
+    except Exception:
+        final_status = 'unknown'
+
+    if final_status in ('completed', 'failed', 'cancelled'):
+        _bound_pipeline_job_id = None
+        _bound_checkpoint_since = None
+        logger.info(f"Job {job_id}: final status={final_status}, worker lock released")
+    elif final_status == 'checkpoint':
+        # Record when the checkpoint wait started
+        _bound_checkpoint_since = datetime.now(timezone.utc)
+        logger.info(f"Job {job_id}: entered checkpoint, timeout in {CHECKPOINT_TIMEOUT}s")
+    else:
+        _bound_checkpoint_since = None
+        logger.info(f"Job {job_id}: status={final_status}, worker stays bound")
 
 
 async def _mcp_stage_plan(job, pipeline_state, active_checkpoints):
@@ -1426,6 +1481,74 @@ async def _mcp_stage_full_run(job, pipeline_state):
 
 # --- 8. 核心工作逻辑 ---
 
+def _poll_bound_pipeline_job():
+    """Check if the exclusively-bound controlled-pipeline job is ready to resume.
+
+    Returns the job dict if it has been re-queued (user confirmed a checkpoint),
+    or None if still waiting / terminal / no binding.
+    """
+    global _bound_pipeline_job_id, _bound_checkpoint_since
+    if _bound_pipeline_job_id is None:
+        return None
+
+    job_id = _bound_pipeline_job_id
+    try:
+        resp = supabase.table('simulations').select('*').eq('id', job_id).execute()
+        if not resp.data:
+            logger.warning(f"Bound job {job_id} not found in DB — releasing lock")
+            _bound_pipeline_job_id = None
+            _bound_checkpoint_since = None
+            return None
+
+        job = resp.data[0]
+        status = job.get('status')
+
+        # --- Checkpoint timeout: auto-fail if user doesn't confirm in time ---
+        if status == 'checkpoint' and _bound_checkpoint_since is not None:
+            elapsed = (datetime.now(timezone.utc) - _bound_checkpoint_since).total_seconds()
+            if elapsed > CHECKPOINT_TIMEOUT:
+                pipeline_stage = job.get('pipeline_stage', 'unknown')
+                logger.warning(
+                    f"Bound job {job_id}: checkpoint '{pipeline_stage}' timed out "
+                    f"after {int(elapsed)}s (limit={CHECKPOINT_TIMEOUT}s). Auto-failing."
+                )
+                run_dir = (job.get('pipeline_state') or {}).get('case_dir') or \
+                          os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
+                _upload_and_fail(
+                    job_id, job['user_id'],
+                    f"Checkpoint '{pipeline_stage}' timed out: no confirmation "
+                    f"received within {CHECKPOINT_TIMEOUT // 60} minutes.",
+                    run_dir=run_dir,
+                    extra_fields={'pipeline_stage': pipeline_stage},
+                )
+                _bound_pipeline_job_id = None
+                _bound_checkpoint_since = None
+                return None
+
+        if status == 'queued':
+            # User confirmed checkpoint — ready to resume. Claim it by
+            # setting status back to 'running' so no other worker touches it.
+            supabase.table('simulations').update(
+                {'status': 'running'}
+            ).eq('id', job_id).eq('status', 'queued').execute()
+            _bound_checkpoint_since = None
+            logger.info(f"Bound job {job_id}: checkpoint confirmed, resuming")
+            return job
+
+        if status in ('completed', 'failed', 'cancelled'):
+            logger.info(f"Bound job {job_id}: reached terminal status={status}, releasing lock")
+            _bound_pipeline_job_id = None
+            _bound_checkpoint_since = None
+            return None
+
+        # Still at checkpoint or running — keep waiting
+        return None
+
+    except Exception as e:
+        logger.error(f"Error polling bound job {job_id}: {e}", exc_info=True)
+        return None
+
+
 def find_and_process_job():
     """
     查找一个'queued'状态的任务并处理它。
@@ -1435,10 +1558,25 @@ def find_and_process_job():
     selects and locks the next queued job using FOR UPDATE SKIP LOCKED,
     preventing multiple Workers from claiming the same job.
 
+    Worker exclusivity: if this worker is bound to a controlled-pipeline job
+    (waiting at a checkpoint), it will ONLY poll that job and refuse to claim
+    any other work until the bound job completes or fails.
+
     Routes based on pipeline_mode:
     - 'controlled': MCP stage-by-stage pipeline with optional checkpoints
     - 'auto' (default): Foam-Agent subprocess one-shot execution
     """
+    # --- Exclusive binding: if we're waiting on a checkpoint job, only poll that ---
+    if _bound_pipeline_job_id is not None:
+        bound_job = _poll_bound_pipeline_job()
+        if bound_job is not None:
+            logger.info(f"Job {bound_job['id']}: resuming bound controlled pipeline")
+            _handle_controlled_pipeline(bound_job)
+            return True
+        # Still waiting on bound job — do NOT claim other work
+        return False
+
+    # --- Normal path: claim the next available queued job ---
     # Atomically claim the next queued job via RPC.
     response = supabase.rpc('claim_next_job').execute()
 
@@ -1453,6 +1591,22 @@ def find_and_process_job():
     # --- Controlled pipeline mode: MCP stage-by-stage ---
     pipeline_mode = job.get('pipeline_mode', 'auto')
     if pipeline_mode == 'controlled':
+        # --- Worker affinity check for checkpoint-resumed jobs ---
+        pipeline_state = job.get('pipeline_state') or {}
+        assigned_worker = pipeline_state.get('assigned_worker_id')
+        if assigned_worker and assigned_worker != WORKER_ID:
+            # This job belongs to a different worker. Re-queue it so the
+            # correct worker (with access to the same filesystem / MCP state)
+            # can pick it up, preventing cross-machine path mismatches.
+            logger.warning(
+                f"Job {job_id}: worker affinity mismatch — assigned to "
+                f"{assigned_worker}, but claimed by {WORKER_ID}. Re-queuing."
+            )
+            supabase.table('simulations').update(
+                {'status': 'queued'}
+            ).eq('id', job_id).execute()
+            return False
+
         logger.info(f"Job {job_id}: controlled pipeline mode")
         _handle_controlled_pipeline(job)
         return True
@@ -1659,7 +1813,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
         with _stats_lock:
             stats = dict(_worker_stats)
         stats['worker_id'] = WORKER_ID
-        stats['status'] = 'busy' if stats.get('current_job_id') else 'idle'
+        stats['bound_pipeline_job_id'] = _bound_pipeline_job_id
+        stats['status'] = 'busy' if stats.get('current_job_id') or _bound_pipeline_job_id else 'idle'
         start = datetime.fromisoformat(stats['start_time'])
         uptime = datetime.now(timezone.utc) - start
         stats['uptime_seconds'] = int(uptime.total_seconds())
