@@ -1551,14 +1551,32 @@ def _poll_bound_pipeline_job():
                 _bound_checkpoint_since = None
                 return None
 
+        # Check if user confirmed the checkpoint (flag in pipeline_state).
+        # The confirm API sets pipeline_state.confirmed=True while keeping
+        # status='checkpoint', so claim_next_job() cannot steal this job.
+        pipeline_state = job.get('pipeline_state') or {}
+        if status == 'checkpoint' and pipeline_state.get('confirmed'):
+            # Clear the confirmed flag and set status to running
+            pipeline_state.pop('confirmed', None)
+            pipeline_state.pop('confirmed_at', None)
+            supabase.table('simulations').update({
+                'status': 'running',
+                'pipeline_state': pipeline_state,
+            }).eq('id', job_id).execute()
+            # Update job dict with latest pipeline_state for downstream use
+            job['pipeline_state'] = pipeline_state
+            job['status'] = 'running'
+            _bound_checkpoint_since = None
+            logger.info(f"Bound job {job_id}: checkpoint confirmed, resuming")
+            return job
+
+        # Legacy support: if confirm endpoint set status='queued' (old behavior)
         if status == 'queued':
-            # User confirmed checkpoint — ready to resume. Claim it by
-            # setting status back to 'running' so no other worker touches it.
             supabase.table('simulations').update(
                 {'status': 'running'}
             ).eq('id', job_id).eq('status', 'queued').execute()
             _bound_checkpoint_since = None
-            logger.info(f"Bound job {job_id}: checkpoint confirmed, resuming")
+            logger.info(f"Bound job {job_id}: checkpoint confirmed (legacy queued), resuming")
             return job
 
         if status in ('completed', 'failed', 'cancelled'):
@@ -1567,7 +1585,7 @@ def _poll_bound_pipeline_job():
             _bound_checkpoint_since = None
             return None
 
-        # Still at checkpoint or running — keep waiting
+        # Still at checkpoint (not confirmed) or running — keep waiting
         return None
 
     except Exception as e:

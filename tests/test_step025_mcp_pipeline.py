@@ -566,7 +566,7 @@ class TestAPIStageConfirm(unittest.TestCase):
 
     @patch('api_server.supabase')
     def test_confirm_controlled_mode(self, mock_sb):
-        """Controlled mode confirm re-queues without clearing pipeline_stage."""
+        """Controlled mode confirm sets confirmed flag, keeps status=checkpoint."""
         mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{
             'id': 'job-ctrl-001',
             'user_id': 'user-001',
@@ -582,10 +582,12 @@ class TestAPIStageConfirm(unittest.TestCase):
         resp = client.post("/api/v1/simulations/job-ctrl-001/stage/confirm")
         self.assertEqual(resp.status_code, 200)
 
-        # Verify pipeline_stage is NOT in the update (kept as-is)
+        # Verify: status stays as checkpoint (NOT queued), confirmed flag set
         update_data = mock_sb.table.return_value.update.call_args[0][0]
-        self.assertEqual(update_data['status'], 'queued')
-        self.assertNotIn('pipeline_stage', update_data)
+        self.assertNotIn('status', update_data)  # status not changed
+        ps = update_data['pipeline_state']
+        self.assertTrue(ps.get('confirmed'))
+        self.assertIn('confirmed_at', ps)
 
     @patch('api_server.supabase')
     def test_confirm_wrong_status_returns_409(self, mock_sb):

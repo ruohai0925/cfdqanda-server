@@ -670,10 +670,13 @@ async def confirm_stage(request: Request, job_id: str, user_id: str = Depends(ve
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
 
-        # Keep pipeline_stage as-is so Worker knows which stage was confirmed
-        # and routes to the next one
+        # Signal the bound worker to resume by setting a flag in pipeline_state.
+        # IMPORTANT: Keep status='checkpoint' (NOT 'queued') so claim_next_job()
+        # won't let another worker steal this job. Only the bound worker's poll
+        # loop checks for the 'confirmed' flag.
+        pipeline_state['confirmed'] = True
+        pipeline_state['confirmed_at'] = datetime.now(timezone.utc).isoformat()
         supabase.table('simulations').update({
-            'status': 'queued',
             'pipeline_state': pipeline_state,
         }).eq('id', job_id).execute()
 
