@@ -1422,8 +1422,27 @@ async def _mcp_stage_full_run(job, pipeline_state):
     job_id = job['id']
     case_dir = pipeline_state.get('case_dir', '')
 
-    # If coming from pre-run, restore original endTime first
+    # If coming from pre-run, restore original endTime first.
+    # Try pipeline_state first; fall back to backup file if pipeline_state lost.
     original_end_time = pipeline_state.get('original_end_time')
+    backup_path = os.path.join(case_dir, 'system', 'controlDict.pre-run-backup') if case_dir else ''
+
+    if not original_end_time and backup_path and os.path.exists(backup_path):
+        # Recover original_end_time from backup file
+        try:
+            from controldict_manager import ControlDictManager
+            mgr = ControlDictManager(case_dir)
+            # Read endTime from the backup (which has the original value)
+            import re
+            with open(backup_path, 'r') as f:
+                backup_content = f.read()
+            match = re.search(r'endTime\s+([^;]+?)\s*;', backup_content)
+            if match:
+                original_end_time = match.group(1).strip()
+                logger.warning(f"Job {job_id}: original_end_time recovered from backup: {original_end_time}")
+        except Exception as e:
+            logger.warning(f"Job {job_id}: failed to recover original_end_time from backup: {e}")
+
     if original_end_time:
         try:
             from normal_run_preparer import NormalRunPreparer
@@ -1439,6 +1458,13 @@ async def _mcp_stage_full_run(job, pipeline_state):
                 extra_fields={'pipeline_stage': 'running'},
             )
             return
+    elif backup_path and os.path.exists(backup_path):
+        # Backup exists but couldn't extract endTime — restore the whole file
+        import shutil
+        controldict_path = os.path.join(case_dir, 'system', 'controlDict')
+        shutil.copy2(backup_path, controldict_path)
+        os.remove(backup_path)
+        logger.warning(f"Job {job_id}: restored controlDict from backup (full file copy)")
 
     _update_pipeline_state(job_id, 'running', 'running', pipeline_state)
     _append_mcp_log(job_id, 'run', f"Starting full simulation run (timeout={SIMULATION_TIMEOUT}s)")
