@@ -30,6 +30,9 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    volumes:
+      # Bind mount api_server.py so git pull takes effect without rebuild
+      - ./api_server.py:/app/api_server.py:ro
     environment:
       # Worker health URL for the admin status endpoint.
       # In Docker Compose, API reaches Worker by service name.
@@ -69,6 +72,13 @@ services:
       # Override MIDDLEWARE_DIR to match the bind mount path inside the container.
       - MIDDLEWARE_DIR=/app/middleware
     volumes:
+      # Bind mount Worker scripts from host into the container.
+      # This overrides the baked-in copies so git pull takes effect immediately
+      # without needing to rebuild the Docker image.
+      - ./worker.py:/app/worker/worker.py:ro
+      - ./mcp_client.py:/app/worker/mcp_client.py:ro
+      - ./allrun_validator.py:/app/worker/allrun_validator.py:ro
+      - ./token_extractor.py:/app/worker/token_extractor.py:ro
       # Bind mount Foam-Agent repo from host into the container.
       # This overrides the baked-in copy, allowing git pull without rebuilding.
       # Set FOAM_AGENT_HOST_PATH in .env to the absolute host path.
