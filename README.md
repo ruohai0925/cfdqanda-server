@@ -33,6 +33,8 @@ Two execution modes:
 | `mcp_client.py` | MCP client for controlled pipeline mode (plan, input_writer, run, review, apply_fixes, visualization) |
 | `allrun_validator.py` | Security audit for OpenFOAM Allrun scripts (whitelist-based command validation) |
 | `token_extractor.py` | Extracts LLM token usage statistics from simulation logs |
+| `analyze_cases.py` | Analyze simulation tasks: status, model, error classification, per-user stats (`--md`, `--csv`, `--ssh`) |
+| `check_storage.py` | Platform resource report: server disk/memory/Docker + Supabase storage usage (`--ssh`, `--quick`, `--detail`) |
 | `cleanup_runs.sh` | Manual disk cleanup script for local `runs/` directories (supports `--all`, `--id`, `--range`, `--before`, `--largest N`, `--dry-run`) |
 | `docker_start_workers.sh` | Start multiple Worker containers with separate WORKER_IDs, MCP ports, and log files |
 | `docker_submit_test_tasks.sh` | Batch-submit test tasks via Supabase Auth login (for multi-worker testing) |
