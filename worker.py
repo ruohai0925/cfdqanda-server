@@ -58,6 +58,14 @@ logger.info(f"Cancel check interval set to {CANCEL_CHECK_INTERVAL} seconds")
 PRE_RUN_TIMEOUT = int(os.environ.get("PRE_RUN_TIMEOUT", "300"))
 logger.info(f"Pre-run timeout set to {PRE_RUN_TIMEOUT} seconds")
 
+# Max disk usage per task (bytes). Default: 400 MB. Task is killed if exceeded.
+TASK_DISK_LIMIT_BYTES = int(os.environ.get("TASK_DISK_LIMIT_MB", "400")) * 1024 * 1024
+logger.info(f"Task disk limit set to {TASK_DISK_LIMIT_BYTES // (1024*1024)} MB")
+
+# How often (seconds) to check disk usage during subprocess run.
+DISK_CHECK_INTERVAL = int(os.environ.get("DISK_CHECK_INTERVAL", "30"))
+logger.info(f"Disk check interval set to {DISK_CHECK_INTERVAL} seconds")
+
 # Health check HTTP server port. Set to 0 to disable.
 HEALTH_CHECK_PORT = int(os.environ.get("HEALTH_CHECK_PORT", "8001"))
 
@@ -115,6 +123,8 @@ _SUBPROCESS_ENV_BLOCKLIST = frozenset({
     'MIDDLEWARE_DIR',
     'SIMULATION_TIMEOUT',
     'STALE_JOB_THRESHOLD',
+    'TASK_DISK_LIMIT_MB',
+    'DISK_CHECK_INTERVAL',
     'MCP_SERVER_PORT',
 })
 
@@ -630,15 +640,127 @@ def _kill_process_tree(process):
         pass  # Already dead
 
 
-# --- 6. Checkpoint helpers ---
+# --- 6. Prompt pre-check ---
 
-def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout):
+import re as _re
+
+# OpenFOAM version patterns: "openfoam 13", "OF13", "openfoam v13", "of 13", etc.
+# We detect versions that are NOT v10 (the platform version).
+_OF_VERSION_RE = _re.compile(
+    r'(?:openfoam|of)\s*(?:v|version\s*)?(\d+)',
+    _re.IGNORECASE
+)
+
+# Convergence tolerance pattern: "1e-7", "10^-8", "10的-7次方", "残差.*1e-7"
+_CONVERGENCE_RE = _re.compile(
+    r'(?:residual|残差|convergence|收敛).*?'
+    r'(?:1e-?(\d+)|10\^-?(\d+)|10的-?(\d+)次)',
+    _re.IGNORECASE
+)
+
+# Platform capabilities note — always appended so Foam-Agent knows constraints.
+_PLATFORM_NOTE = (
+    "[PLATFORM CONSTRAINTS] "
+    "OpenFOAM v10 (not v11/v12/v13 — use v10-compatible API and syntax). "
+    "Single-core only — do NOT use decomposePar or runParallel. "
+    "All simulations must run in serial mode. "
+    "After meshing, check cell count — if > 2 million cells, "
+    "warn user and consider coarsening the mesh. "
+    "snappyHexMesh is supported with built-in searchable geometries "
+    "(searchableBox, searchableCylinder, searchableSphere, etc.), "
+    "but NO STL file generation capability — if complex geometry requires "
+    "an STL that cannot be described by searchable primitives, "
+    "report that user must upload a custom mesh (.msh). "
+    "Users can upload Gmsh .msh files via --custom_mesh_path. "
+    f"Max output size: {{}}" "MB. "  # filled at runtime
+    "Use purgeWrite to limit stored timesteps."
+)
+
+
+def _check_prompt(prompt, job_id):
     """
-    Run a subprocess with polling for timeout and cancellation.
+    Pre-check user prompt for known issues before running Foam-Agent.
+
+    Returns a list of warning dicts: [{'type': str, 'message': str}, ...]
+    Each warning is appended to the prompt as [PLATFORM NOTE] and logged.
+    The platform capabilities note is always included.
+    """
+    warnings = []
+
+    # Always include platform capabilities
+    limit_mb = TASK_DISK_LIMIT_BYTES // (1024 * 1024)
+    warnings.append({
+        'type': 'platform_info',
+        'message': _PLATFORM_NOTE.format(limit_mb),
+    })
+
+    # 1. OpenFOAM version mismatch
+    for m in _OF_VERSION_RE.finditer(prompt):
+        version = int(m.group(1))
+        if version != 10:
+            warnings.append({
+                'type': 'of_version_mismatch',
+                'message': (
+                    f"User prompt mentions OpenFOAM {version}, but this "
+                    f"platform runs OpenFOAM v10. Use v10-compatible syntax "
+                    f"(e.g. 'stopAt endTime' not 'stopAt maxClockTime', "
+                    f"'Gauss upwind' not 'bounded Gauss ...', "
+                    f"'compressible::alphatJayatillekeWallFunction' with "
+                    f"namespace prefix)."
+                ),
+            })
+            break
+
+    # 2. Overly strict convergence criteria
+    for m in _CONVERGENCE_RE.finditer(prompt):
+        exponent = int(m.group(1) or m.group(2) or m.group(3))
+        if exponent >= 6:
+            warnings.append({
+                'type': 'strict_convergence',
+                'message': (
+                    f"Convergence target 1e-{exponent} is very strict for "
+                    f"RANS simulations. Residuals of 1e-4 ~ 1e-5 are typically "
+                    f"sufficient. Overly strict targets may cause timeout."
+                ),
+            })
+            break
+
+    # Log non-platform warnings
+    real_warnings = [w for w in warnings if w['type'] != 'platform_info']
+    if real_warnings:
+        types = [w['type'] for w in real_warnings]
+        logger.info(f"Job {job_id}: prompt pre-check warnings: {types}")
+        for w in real_warnings:
+            logger.info(f"  [{w['type']}] {w['message']}")
+
+    return warnings
+
+
+# --- 7. Disk monitoring & subprocess helpers ---
+
+def _get_dir_size_bytes(path):
+    """Get total size of a directory in bytes (non-recursive os.scandir for speed)."""
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+            elif entry.is_dir(follow_symlinks=False):
+                total += _get_dir_size_bytes(entry.path)
+    except (OSError, PermissionError):
+        pass
+    return total
+
+
+def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout,
+                                 run_dir=None):
+    """
+    Run a subprocess with polling for timeout, cancellation, and disk usage.
 
     Returns:
-        (returncode, cancelled, timed_out) tuple.
-        returncode is None if cancelled or timed_out before natural completion.
+        (returncode, cancelled, timed_out, disk_exceeded) tuple.
+        returncode is None if cancelled, timed_out, or disk_exceeded before
+        natural completion.
     """
     with open(log_path, 'w') as log_file:
         process = subprocess.Popen(
@@ -652,8 +774,10 @@ def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout):
         )
 
         start_time = time.time()
+        last_disk_check = 0
         cancelled = False
         timed_out = False
+        disk_exceeded = False
 
         while True:
             retcode = process.poll()
@@ -673,13 +797,35 @@ def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout):
                 _kill_process_tree(process)
                 break
 
+            # Periodic disk usage check
+            if run_dir and (elapsed - last_disk_check) >= DISK_CHECK_INTERVAL:
+                last_disk_check = elapsed
+                dir_size = _get_dir_size_bytes(run_dir)
+                dir_size_mb = dir_size / (1024 * 1024)
+                if dir_size > TASK_DISK_LIMIT_BYTES:
+                    disk_exceeded = True
+                    limit_mb = TASK_DISK_LIMIT_BYTES // (1024 * 1024)
+                    logger.error(
+                        f"Job {job_id}: disk usage {dir_size_mb:.0f} MB "
+                        f"exceeds limit {limit_mb} MB. Terminating."
+                    )
+                    _kill_process_tree(process)
+                    break
+                elif dir_size_mb > 100:
+                    limit_mb = TASK_DISK_LIMIT_BYTES // (1024 * 1024)
+                    logger.info(
+                        f"Job {job_id}: disk usage {dir_size_mb:.0f} MB "
+                        f"/ {limit_mb} MB"
+                    )
+
             time.sleep(CANCEL_CHECK_INTERVAL)
 
-    return process.returncode, cancelled, timed_out
+    return process.returncode, cancelled, timed_out, disk_exceeded
 
 
-def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path, cancelled, timed_out):
-    """Update DB for cancelled or timed-out jobs. Returns True if handled."""
+def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
+                                  cancelled, timed_out, disk_exceeded=False):
+    """Update DB for cancelled, timed-out, or disk-exceeded jobs. Returns True if handled."""
     if cancelled:
         logger.info(f"Job {job_id} was cancelled by user. Subprocess terminated.")
         _upload_and_fail(job_id, user_id, 'Simulation cancelled by user.',
@@ -687,6 +833,21 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path, cancelled, 
                          extra_result={'log_path_on_server': log_path})
         # Override status to 'cancelled' (not 'failed')
         supabase.table('simulations').update({'status': 'cancelled'}).eq('id', job_id).execute()
+        return True
+
+    if disk_exceeded:
+        limit_mb = TASK_DISK_LIMIT_BYTES // (1024 * 1024)
+        _upload_and_fail(
+            job_id, user_id,
+            f'Simulation terminated: output exceeded {limit_mb} MB disk limit. '
+            f'This usually means the mesh is too large or write frequency is too high. '
+            f'Please simplify the geometry or reduce output frequency.',
+            run_dir=run_dir,
+            extra_result={
+                'log_path_on_server': log_path,
+                'error_category': 'disk_exceeded',
+            },
+        )
         return True
 
     if timed_out:
@@ -727,6 +888,30 @@ def _run_allrun_audit(run_dir, job_id):
                 f"({allrun_audit['files_scanned']} file(s) scanned)"
             )
     return allrun_audit
+
+
+def _download_mesh_file(job_id, mesh_file_info, run_dir):
+    """Download mesh file from Supabase Storage to local run directory.
+
+    Returns local path on success, None on failure.
+    """
+    storage_path = mesh_file_info.get('storage_path')
+    original_name = mesh_file_info.get('original_name', 'mesh.msh')
+    if not storage_path:
+        return None
+    local_mesh_path = os.path.join(run_dir, original_name)
+    try:
+        data = supabase.storage.from_('simulation_results').download(storage_path)
+        with open(local_mesh_path, 'wb') as f:
+            f.write(data)
+        logger.info(
+            f"Job {job_id}: downloaded mesh '{original_name}' "
+            f"({len(data)} bytes) to {local_mesh_path}"
+        )
+        return local_mesh_path
+    except Exception as e:
+        logger.error(f"Job {job_id}: failed to download mesh file: {e}")
+        return None
 
 
 def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None,
@@ -803,6 +988,14 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
     _increment_stat('jobs_processed')
     _increment_stat('jobs_failed')
     _update_stats(current_job_id=None)
+
+    # Clean up local files after successful upload to Supabase Storage
+    if run_dir and os.path.isdir(run_dir):
+        try:
+            shutil.rmtree(run_dir)
+            logger.info(f"Job {job_id}: cleaned up local run directory {run_dir}")
+        except Exception as e:
+            logger.warning(f"Job {job_id}: failed to clean up local dir: {e}")
 
 
 def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun_audit,
@@ -885,6 +1078,14 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
 
     logger.info(f"Job {job_id} completed and all files uploaded successfully. "
                f"Total files: {uploaded_count}, Failed: {failed_count}")
+
+    # Clean up local files after successful upload to Supabase Storage
+    if run_dir and os.path.isdir(run_dir):
+        try:
+            shutil.rmtree(run_dir)
+            logger.info(f"Job {job_id}: cleaned up local run directory {run_dir}")
+        except Exception as e:
+            logger.warning(f"Job {job_id}: failed to clean up local dir: {e}")
     _increment_stat('jobs_processed')
     _increment_stat('jobs_succeeded')
     _update_stats(current_job_id=None)
@@ -1053,11 +1254,26 @@ def _handle_controlled_pipeline(job):
     _bound_pipeline_job_id = job_id
     logger.info(f"Job {job_id}: worker {WORKER_ID} exclusively bound")
 
-    # Write task_settings.json for new jobs (first stage entry only)
+    # Write task_settings.json and download mesh for new jobs (first stage only)
     if pipeline_stage is None:
         llm_config = job.get('llm_config') or {}
         run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
         os.makedirs(run_dir, exist_ok=True)
+
+        # Download custom mesh if provided
+        mesh_file_info = job.get('mesh_file')
+        if mesh_file_info:
+            mesh_path = _download_mesh_file(job_id, mesh_file_info, run_dir)
+            if not mesh_path:
+                _upload_and_fail(job_id, job['user_id'],
+                                 'Failed to download uploaded mesh file.',
+                                 run_dir=run_dir,
+                                 extra_result={'error_category': 'mesh_download_failed'})
+                _bound_pipeline_job_id = None
+                return
+            # Store in pipeline_state so MCP stages can find it
+            pipeline_state['custom_mesh_path'] = mesh_path
+
         task_settings = {
             'job_id': str(job_id),
             'user_id': job.get('user_id'),
@@ -1071,6 +1287,8 @@ def _handle_controlled_pipeline(job):
             'pre_run_end_time': job.get('pre_run_end_time'),
             'checkpoints': active_checkpoints,
             'worker_id': WORKER_ID,
+            'has_custom_mesh': bool(mesh_file_info),
+            'mesh_original_name': (mesh_file_info or {}).get('original_name'),
         }
         try:
             with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
@@ -1701,12 +1919,33 @@ def find_and_process_job():
     run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
     os.makedirs(run_dir, exist_ok=True)
 
+    prompt_text = job['prompt']
+    prompt_warnings = _check_prompt(prompt_text, job_id)
+
+    # Append platform context to prompt so Foam-Agent is aware of constraints
+    if prompt_warnings:
+        prompt_text = prompt_text + "\n\n" + "\n".join(
+            f"[PLATFORM NOTE] {w['message']}" for w in prompt_warnings
+        )
+
     prompt_path = os.path.join(run_dir, "prompt.txt")
     with open(prompt_path, "w") as f:
-        f.write(job['prompt'])
+        f.write(prompt_text)
 
     output_path = os.path.join(run_dir, "output")
     log_path = os.path.join(run_dir, "simulation.log")
+
+    # Download custom mesh file if provided
+    custom_mesh_path = None
+    mesh_file_info = job.get('mesh_file')
+    if mesh_file_info:
+        custom_mesh_path = _download_mesh_file(job_id, mesh_file_info, run_dir)
+        if not custom_mesh_path:
+            _upload_and_fail(job_id, job['user_id'],
+                             'Failed to download uploaded mesh file.',
+                             run_dir=run_dir,
+                             extra_result={'error_category': 'mesh_download_failed'})
+            return True
 
     # Write task_settings.json — records all non-secret settings for post-hoc analysis.
     # Uploaded to Supabase Storage alongside other run files.
@@ -1723,6 +1962,9 @@ def find_and_process_job():
         'pre_run_end_time': job.get('pre_run_end_time'),
         'checkpoints': (job.get('pipeline_state') or {}).get('active_checkpoints'),
         'worker_id': WORKER_ID,
+        'prompt_warnings': prompt_warnings if prompt_warnings else None,
+        'has_custom_mesh': bool(custom_mesh_path),
+        'mesh_original_name': (mesh_file_info or {}).get('original_name'),
     }
     try:
         with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
@@ -1749,7 +1991,11 @@ def find_and_process_job():
         child_env['FOAMAGENT_MODEL_VERSION'] = effective_version
         child_env['FOAM_OUTPUT_DIR'] = os.path.abspath(output_path)
         child_env['FOAM_PROMPT_PATH'] = os.path.abspath(prompt_path)
+        if custom_mesh_path:
+            child_env['FOAM_CUSTOM_MESH_PATH'] = os.path.abspath(custom_mesh_path)
         logger.info(f"Job {job_id}: using provider={effective_provider}, model={effective_version}")
+        if custom_mesh_path:
+            logger.info(f"Job {job_id}: custom mesh → {custom_mesh_path}")
 
         # Config.__post_init__() reads FOAMAGENT_MODEL_PROVIDER/VERSION natively,
         # so no need for the inspect-based patching hack anymore.
@@ -1758,23 +2004,32 @@ def find_and_process_job():
             "import os,sys; sys.path.insert(0,'src'); "
             "from config import Config; from main import main; "
             "c=Config(); c.case_dir=os.environ['FOAM_OUTPUT_DIR']; "
-            "main(open(os.environ['FOAM_PROMPT_PATH']).read(),c)"
+            "main(open(os.environ['FOAM_PROMPT_PATH']).read(),c,"
+            "os.environ.get('FOAM_CUSTOM_MESH_PATH'))"
         ]
 
         logger.info(f"Executing command for job {job_id}: {' '.join(command)}")
         logger.info(f"Log file for this run will be at: {log_path}")
 
+        # Per-job timeout (user-configurable) or global default
+        job_timeout = SIMULATION_TIMEOUT
+        if job.get('timeout_minutes'):
+            job_timeout = int(job['timeout_minutes']) * 60
+            logger.info(f"Job {job_id}: using custom timeout {job['timeout_minutes']} min")
+
         # Run Foam-Agent subprocess with polling
-        returncode, cancelled, timed_out = _run_subprocess_with_polling(
+        returncode, cancelled, timed_out, disk_exceeded = _run_subprocess_with_polling(
             command=command,
             cwd=FOAM_AGENT_DIR,
             env=child_env,
             log_path=log_path,
             job_id=job_id,
-            timeout=SIMULATION_TIMEOUT,
+            timeout=job_timeout,
+            run_dir=run_dir,
         )
 
-        if _handle_cancelled_or_timeout(job_id, job['user_id'], run_dir, log_path, cancelled, timed_out):
+        if _handle_cancelled_or_timeout(job_id, job['user_id'], run_dir, log_path,
+                                        cancelled, timed_out, disk_exceeded):
             return True
 
         # Post-execution Allrun security audit
@@ -1795,6 +2050,13 @@ def find_and_process_job():
                 error_msg = user_msg
             else:
                 error_msg = f"Foam-Agent script failed with return code {returncode}."
+                # Classify OOM (killed by signal 9)
+                if returncode == -9 or returncode == 137:
+                    err_cat = 'oom'
+                    error_msg = (
+                        "Simulation was killed due to out-of-memory (OOM). "
+                        "The mesh may be too large for single-core execution."
+                    )
             _upload_and_fail(
                 job_id, job['user_id'],
                 error_msg,

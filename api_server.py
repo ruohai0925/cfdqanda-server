@@ -146,12 +146,21 @@ class LLMConfig(BaseModel):
 # 使用 Pydantic 定义前端发送过来的请求体(body)应该长什么样
 # 这可以提供自动的数据验证和生成 API 文档
 # Note: user_id is no longer in the body — it comes from JWT (verify_jwt dependency)
+MESH_FILE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+
+class MeshFileInfo(BaseModel):
+    storage_path: str
+    original_name: str
+    size_bytes: int
+
 class SimulationRequest(BaseModel):
     prompt: str
     llm_config: Optional[LLMConfig] = None  # 用户可选的 LLM 配置
     pre_run_end_time: Optional[int] = None  # Pre-run timesteps: None=default(10), -1=disabled, positive=custom
     pipeline_mode: str = 'auto'  # 'auto' (subprocess one-shot) or 'controlled' (MCP stage-by-stage)
     checkpoints: Optional[List[str]] = None  # Active checkpoints: ['files_review', 'pre_run_review', 'plan_review']
+    mesh_file: Optional[MeshFileInfo] = None  # Optional custom mesh (.msh) uploaded to Supabase Storage
+    timeout_minutes: Optional[int] = None  # Custom timeout in minutes (default: 60)
 
 class FeedbackRequest(BaseModel):
     file_path: str  # 文件路径，如 "output/log.blockMesh"
@@ -220,6 +229,16 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
                        f"Please delete old tasks to free space."
             )
 
+        # Validate mesh file if provided
+        if sim_request.mesh_file:
+            if not sim_request.mesh_file.original_name.lower().endswith('.msh'):
+                raise HTTPException(status_code=400, detail="Only .msh mesh files are supported")
+            if sim_request.mesh_file.size_bytes > MESH_FILE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Mesh file exceeds {MESH_FILE_MAX_BYTES // (1024*1024)} MB limit"
+                )
+
         # 构建插入数据
         insert_data = {
             'prompt': sim_request.prompt,
@@ -239,6 +258,14 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
                 insert_data['pipeline_state'] = {
                     'active_checkpoints': sim_request.checkpoints
                 }
+        # Custom mesh file reference
+        if sim_request.mesh_file:
+            insert_data['mesh_file'] = sim_request.mesh_file.model_dump()
+        # Custom timeout
+        if sim_request.timeout_minutes is not None:
+            if sim_request.timeout_minutes not in (20, 40, 60, 120):
+                raise HTTPException(status_code=400, detail="Invalid timeout. Choose 20, 40, 60, or 120 minutes.")
+            insert_data['timeout_minutes'] = sim_request.timeout_minutes
 
         # 将新任务插入到 'simulations' 表中
         response = supabase.table('simulations').insert(insert_data).execute()

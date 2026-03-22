@@ -15,6 +15,10 @@ echo "=== Rebuilding cfdqanda-api image ==="
 docker build -f Dockerfile.api -t cfdqanda-api .
 
 echo ""
+echo "=== Cleaning up old build cache ==="
+docker builder prune -f --filter "until=24h"
+
+echo ""
 echo "=== Restarting api + ${NUM_WORKERS} worker(s) ==="
 docker compose up -d --force-recreate --scale worker="$NUM_WORKERS" worker api
 

@@ -12,7 +12,9 @@
 #
 # Build:  docker build -f Dockerfile.worker -t cfdqanda-worker .
 # Run:    docker run --env-file .env -v /path/to/Foam-Agent:/home/openfoam/Foam-Agent cfdqanda-worker
-# Size:   Same as leoyue123/foamagent base (~5-8 GB depending on GPU packages)
+# Size:   ~28.5 GB (conda 16.3G + OpenFOAM 11G + boost/pip/src ~1.2G)
+#         The base image is very large due to full PyTorch+CUDA+ML stack in conda.
+#         See Foam-Agent-Comments.md for optimization suggestions.
 
 FROM leoyue123/foamagent:latest
 
