@@ -45,10 +45,12 @@ logger.info(f"FOAM_AGENT_DIR resolved to: {FOAM_AGENT_DIR}")
 SIMULATION_TIMEOUT = int(os.environ.get("SIMULATION_TIMEOUT", "3600"))
 logger.info(f"Simulation timeout set to {SIMULATION_TIMEOUT} seconds")
 
-# Stale job recovery threshold (seconds). Default: 7200 (2 hours).
-# Jobs stuck in 'running' longer than this are reset to 'queued' on Worker startup.
-STALE_JOB_THRESHOLD = int(os.environ.get("STALE_JOB_THRESHOLD", "7200"))
-logger.info(f"Stale job threshold set to {STALE_JOB_THRESHOLD} seconds")
+# Stale job recovery threshold (seconds).
+# A running job older than this is considered stuck and will be reset to 'queued'.
+# Defaults to SIMULATION_TIMEOUT + 10 min buffer (for upload/cleanup time).
+_default_stale = SIMULATION_TIMEOUT + 600
+STALE_JOB_THRESHOLD = int(os.environ.get("STALE_JOB_THRESHOLD", str(_default_stale)))
+logger.info(f"Stale job threshold set to {STALE_JOB_THRESHOLD} seconds ({STALE_JOB_THRESHOLD//60} min)")
 
 # How often (seconds) to check DB for cancellation while subprocess is running.
 CANCEL_CHECK_INTERVAL = int(os.environ.get("CANCEL_CHECK_INTERVAL", "5"))
