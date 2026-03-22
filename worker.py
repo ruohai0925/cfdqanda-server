@@ -413,34 +413,49 @@ def recover_stale_jobs():
     """
     Recover jobs stuck in 'running' status due to a previous Worker crash.
 
-    If a job has been 'running' for longer than STALE_JOB_THRESHOLD seconds
-    (default: 2 hours), reset it to 'queued' so it can be picked up again.
+    Finds ALL 'running' jobs and checks if their created_at is older than
+    STALE_JOB_THRESHOLD (default: 2 hours). Uses created_at instead of
+    updated_at because the cancel-check polling loop updates updated_at
+    continuously, making it unreliable for staleness detection.
+
     Called once at Worker startup.
     """
-    threshold = datetime.now(timezone.utc) - timedelta(seconds=STALE_JOB_THRESHOLD)
-    threshold_iso = threshold.isoformat()
-
     try:
         response = (
             supabase.table('simulations')
-            .select('id, updated_at')
+            .select('id, created_at')
             .eq('status', 'running')
-            .lt('updated_at', threshold_iso)
             .execute()
         )
 
-        stale_jobs = response.data
-        if not stale_jobs:
+        if not response.data:
             logger.info("No stale jobs found during startup recovery.")
+            return
+
+        now = datetime.now(timezone.utc)
+        stale_jobs = []
+        for job in response.data:
+            try:
+                created = datetime.fromisoformat(job['created_at'].replace('Z', '+00:00'))
+                age_seconds = (now - created).total_seconds()
+                if age_seconds > STALE_JOB_THRESHOLD:
+                    job['_age_hours'] = age_seconds / 3600
+                    stale_jobs.append(job)
+            except Exception:
+                stale_jobs.append(job)  # Can't parse date → treat as stale
+
+        if not stale_jobs:
+            logger.info(f"No stale jobs found ({len(response.data)} running job(s) are within threshold).")
             return
 
         logger.warning(f"Found {len(stale_jobs)} stale job(s) stuck in 'running' status.")
 
         for job in stale_jobs:
             job_id = job['id']
+            age_h = job.get('_age_hours', '?')
             logger.warning(
                 f"Recovering stale job {job_id} "
-                f"(updated_at: {job.get('updated_at', 'unknown')}). "
+                f"(created {age_h:.1f}h ago, threshold {STALE_JOB_THRESHOLD/3600:.1f}h). "
                 f"Resetting to 'queued'."
             )
             # Clear worker affinity so any available worker can pick it up.
