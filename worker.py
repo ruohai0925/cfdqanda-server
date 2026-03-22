@@ -560,7 +560,7 @@ def _purge_deleted_simulations():
     try:
         response = (
             supabase.table('simulations')
-            .select('id, user_id, result_data')
+            .select('id, user_id, result_data, mesh_file')
             .not_.is_('deleted_at', 'null')
             .lt('deleted_at', cutoff)
             .execute()
@@ -586,7 +586,17 @@ def _purge_deleted_simulations():
                 except Exception as e:
                     logger.warning(f"Purge: failed to remove Storage files for job {job_id}: {e}")
 
-            # 2. Delete local runs/ directory
+            # 2. Delete uploaded mesh file from Supabase Storage
+            mesh_file = row.get('mesh_file') or {}
+            mesh_path = mesh_file.get('storage_path')
+            if mesh_path:
+                try:
+                    supabase.storage.from_('simulation_results').remove([mesh_path])
+                    logger.info(f"Purge: removed mesh file {mesh_path} for job {job_id}")
+                except Exception as e:
+                    logger.warning(f"Purge: failed to remove mesh file for job {job_id}: {e}")
+
+            # 3. Delete local runs/ directory
             local_run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
             if os.path.isdir(local_run_dir):
                 try:
