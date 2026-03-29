@@ -217,6 +217,7 @@ With UptimeRobot configured, step 1 is automated — you get an email alert when
 
 ### 2026-03-29
 
+- **Self-service invitation code board** (`InvitationBoard.jsx`, `App.jsx`, `Auth.jsx`): Public page at `#invite` displaying 20 invitation codes with copy buttons. Used codes shown as grayed out. Auto-generates a new batch via Supabase RPC (`list_invitation_codes_with_replenish`) when all codes are claimed. Registration form links to the board with "Get a code here".
 - **Fixed MCP server ignoring BYOK LLM config** (`mcp_client.py`, `worker.py`): In controlled pipeline mode, the MCP server subprocess was started without `FOAMAGENT_MODEL_PROVIDER`, `FOAMAGENT_MODEL_VERSION`, or API key env vars, causing it to always default to `openai-codex`. BYOK users (e.g. DeepSeek) hit the Codex OAuth endpoint and failed with `HTTP 401 token_expired`. Fix: `MCPServerManager.start()` now accepts `llm_env` dict; `_ensure_mcp_server()` builds LLM env vars from the job's `llm_config` and auto-restarts the server when config changes between jobs.
 - **Added heavy simulation pre-check** (`worker.py`): `_check_prompt()` now detects keywords for LES, DES, DPM, FWH/acoustics, FSI, reacting flow, and 3D VOF — injects a `[PLATFORM NOTE]` warning to use coarse mesh and `purgeWrite` to avoid disk/memory limits.
 - **Codex token expiry email alert**: Set up `msmtp` + Gmail SMTP + daily cron (`codex-token-sync.sh check --cron`) to send email alert 2 days before token expires. Login still requires manual browser interaction (`./codex-token-sync.sh login`).
