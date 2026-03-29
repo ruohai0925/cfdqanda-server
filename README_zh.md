@@ -252,7 +252,7 @@ curl localhost:8000/api/v1/admin/status
 
 - **自助邀请码领取页面**（`InvitationBoard.jsx`、`App.jsx`、`Auth.jsx`）：`#invite` 路由下的公开页面，展示 20 个邀请码并提供复制按钮。已使用的邀请码显示为灰色删除线。所有邀请码用完后通过 Supabase RPC（`list_invitation_codes_with_replenish`）自动生成新一批。注册表单邀请码输入框旁添加"没有邀请码？点此领取"链接。
 - **修复 MCP 服务器忽略 BYOK LLM 配置**（`mcp_client.py`、`worker.py`）：受控流水线模式下，MCP 服务器子进程启动时未传递 `FOAMAGENT_MODEL_PROVIDER`、`FOAMAGENT_MODEL_VERSION` 和 API key 等环境变量，导致始终回退到 `openai-codex` 默认值。BYOK 用户（如 DeepSeek）命中 Codex OAuth 端点并收到 `HTTP 401 token_expired` 错误。修复：`MCPServerManager.start()` 新增 `llm_env` 参数；`_ensure_mcp_server()` 从任务的 `llm_config` 构建 LLM 环境变量，并在不同任务间配置变化时自动重启 MCP 服务器。
-- **新增重型仿真 prompt 预检**（`worker.py`）：`_check_prompt()` 新增检测 LES、DES、DPM、FWH/声学、FSI、反应流和 3D VOF 等关键词，命中时注入 `[PLATFORM NOTE]` 警告 Foam-Agent 使用粗网格和 `purgeWrite`，避免超出磁盘/内存限制。
+- **新增重型仿真 prompt 预检**（`worker.py`）：`_check_prompt()` 新增检测 LES、DES、DPM、FWH/声学、FSI、反应流和 3D VOF 等关键词，命中时注入 `[PLATFORM NOTE]`，鉴于平台资源限制，推荐使用粗网格和 `purgeWrite`，避免超出磁盘/内存限制。
 - **Codex token 过期邮件告警**：配置 `msmtp` + Gmail SMTP + 每日 cron（`codex-token-sync.sh check --cron`），token 过期前 2 天发邮件提醒。登录仍需手动浏览器交互（`./codex-token-sync.sh login`）。
 - **修正 cron 路径**：旧 cron 指向错误目录（`cfdqanda-server/`），已修正到项目根目录（`cfdqanda/`）。
 - **更新 Foam-Agent 微信社区说明**：将 "maintainer" 改为 "volunteer"，添加微信号作为扫码入群的替代方式（[PR #24](https://github.com/csml-rpi/Foam-Agent/pull/24)）。
