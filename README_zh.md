@@ -252,7 +252,7 @@ curl localhost:8000/api/v1/admin/status
 
 - **Codex token 过期邮件告警**：配置 `msmtp` + Gmail SMTP + 每日 cron（`codex-token-sync.sh check --cron`），token 过期前 2 天发邮件提醒。登录仍需手动浏览器交互（`./codex-token-sync.sh login`）。
 - **修正 cron 路径**：旧 cron 指向错误目录（`cfdqanda-server/`），已修正到项目根目录（`cfdqanda/`）。
-- **关闭 commit 中的 Co-Authored-By**：在 `~/.claude/settings.json` 中将 `attribution.commit` 和 `attribution.pr` 设为空字符串，全局去除 Claude 署名。
+- **更新 Foam-Agent 微信社区说明**：将 "maintainer" 改为 "volunteer"，添加微信号作为扫码入群的替代方式（[PR #24](https://github.com/csml-rpi/Foam-Agent/pull/24)）。
 
 ## 测试
 

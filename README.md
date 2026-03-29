@@ -219,7 +219,7 @@ With UptimeRobot configured, step 1 is automated — you get an email alert when
 
 - **Codex token expiry email alert**: Set up `msmtp` + Gmail SMTP + daily cron (`codex-token-sync.sh check --cron`) to send email alert 2 days before token expires. Login still requires manual browser interaction (`./codex-token-sync.sh login`).
 - **Fixed cron job path**: Previous cron pointed to wrong directory (`cfdqanda-server/codex-token-sync.sh`), corrected to project root (`cfdqanda/codex-token-sync.sh`).
-- **Disabled Co-Authored-By in commits**: Set `attribution.commit` and `attribution.pr` to empty string in `~/.claude/settings.json` to remove Claude co-author trailer globally.
+- **Updated Foam-Agent WeChat community text**: Changed "maintainer" to "volunteer", added WeChat account as alternative to QR code scanning ([PR #24](https://github.com/csml-rpi/Foam-Agent/pull/24)).
 
 ## Tests
 
