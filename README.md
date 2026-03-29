@@ -217,6 +217,7 @@ With UptimeRobot configured, step 1 is automated — you get an email alert when
 
 ### 2026-03-29
 
+- **Added heavy simulation pre-check** (`worker.py`): `_check_prompt()` now detects keywords for LES, DES, DPM, FWH/acoustics, FSI, reacting flow, and 3D VOF — injects a `[PLATFORM NOTE]` warning to use coarse mesh and `purgeWrite` to avoid disk/memory limits.
 - **Codex token expiry email alert**: Set up `msmtp` + Gmail SMTP + daily cron (`codex-token-sync.sh check --cron`) to send email alert 2 days before token expires. Login still requires manual browser interaction (`./codex-token-sync.sh login`).
 - **Fixed cron job path**: Previous cron pointed to wrong directory (`cfdqanda-server/codex-token-sync.sh`), corrected to project root (`cfdqanda/codex-token-sync.sh`).
 - **Updated Foam-Agent WeChat community text**: Changed "maintainer" to "volunteer", added WeChat account as alternative to QR code scanning ([PR #24](https://github.com/csml-rpi/Foam-Agent/pull/24)).

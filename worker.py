@@ -752,6 +752,39 @@ def _check_prompt(prompt, job_id):
             })
             break
 
+    # 3. Complex simulations likely to exceed disk/memory limits
+    prompt_lower = prompt.lower()
+    _heavy_keywords = [
+        ('LES', r'\bles\b|large.eddy.simul'),
+        ('DES', r'\bdes\b|detached.eddy'),
+        ('DPM', r'\bdpm\b|discrete.phase|lagrangian.particle'),
+        ('VOF+3D', None),  # handled specially below
+        ('FWH/acoustics', r'\bfwh\b|ffowcs|acoustic|噪声仿真|声压'),
+        ('FSI', r'\bfsi\b|fluid.structure|流固耦合|solids4foam'),
+        ('reacting flow', r'reactingfoam|反应流|supercritical.*water.*oxidation|scwo'),
+    ]
+    heavy_matches = []
+    for label, pattern in _heavy_keywords:
+        if pattern and _re.search(pattern, prompt, _re.IGNORECASE):
+            heavy_matches.append(label)
+    # VOF+3D: interFoam in 3D (not 2D) tends to be very large
+    if _re.search(r'interfoam', prompt, _re.IGNORECASE) and not _re.search(r'2d|二维|empty.*type|两相.*2', prompt, _re.IGNORECASE):
+        heavy_matches.append('VOF+3D')
+
+    if heavy_matches:
+        warnings.append({
+            'type': 'heavy_simulation',
+            'message': (
+                f"This simulation involves {', '.join(heavy_matches)} which "
+                f"typically requires large mesh and/or high output frequency. "
+                f"On this single-core platform with {limit_mb}MB disk limit, "
+                f"use a very coarse mesh (< 500K cells), set purgeWrite to "
+                f"limit stored timesteps, and use a large writeInterval to "
+                f"reduce output size. Keep the geometry and physics as simple "
+                f"as possible to avoid disk/memory limits."
+            ),
+        })
+
     # Log non-platform warnings
     real_warnings = [w for w in warnings if w['type'] != 'platform_info']
     if real_warnings:
@@ -1140,12 +1173,62 @@ def _get_mcp_server_manager():
     return _mcp_server_manager
 
 
-def _ensure_mcp_server():
-    """Ensure MCP server is running, start it if not."""
+def _build_llm_env(llm_config):
+    """Build LLM-specific env vars from a job's llm_config for MCP subprocess.
+
+    Mirrors the env var setup in auto mode (lines ~1903-2023) so the MCP server's
+    Foam-Agent Config picks up the correct provider, model, and credentials.
+    """
+    if not llm_config:
+        llm_config = {}
+
+    env = {}
+    effective_provider = llm_config.get('model_provider') or 'openai-codex'
+    effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+
+    # OpenAI-compatible providers: map to 'openai' for Foam-Agent
+    base_url = llm_config.get('base_url')
+    if base_url:
+        env['OPENAI_API_BASE'] = base_url
+    if effective_provider in ('deepseek', 'qwen'):
+        effective_provider = 'openai'
+
+    env['FOAMAGENT_MODEL_PROVIDER'] = effective_provider
+    env['FOAMAGENT_MODEL_VERSION'] = effective_version
+
+    # Inject user-provided API key
+    user_api_key = llm_config.get('api_key')
+    if user_api_key:
+        provider = llm_config.get('model_provider', 'openai')
+        if provider == 'anthropic':
+            env['ANTHROPIC_API_KEY'] = user_api_key
+        else:
+            env['OPENAI_API_KEY'] = user_api_key
+
+    # Inject user-provided Codex OAuth token
+    codex_token = llm_config.get('codex_token')
+    if codex_token:
+        temp_codex_dir = os.path.join(FOAM_AGENT_DIR, "runs", ".mcp_codex_auth")
+        os.makedirs(temp_codex_dir, exist_ok=True)
+        auth_json_path = os.path.join(temp_codex_dir, "auth.json")
+        with open(auth_json_path, "w") as f:
+            json.dump({"access_token": codex_token}, f)
+        env['CODEX_HOME'] = temp_codex_dir
+
+    return env
+
+
+def _ensure_mcp_server(llm_config=None):
+    """Ensure MCP server is running with the correct LLM config.
+
+    If the server is already running with a different LLM config,
+    it will be restarted with the new config.
+    """
     mgr = _get_mcp_server_manager()
+    llm_env = _build_llm_env(llm_config)
     if not mgr.is_running:
         logger.info("Starting MCP server for controlled pipeline...")
-        mgr.start(timeout=60.0)
+    mgr.start(timeout=60.0, llm_env=llm_env)
 
 
 def _append_mcp_log(job_id, stage, message):
@@ -1324,8 +1407,21 @@ def _handle_controlled_pipeline(job):
             logger.warning(f"Job {job_id}: failed to write task_settings.json: {e}")
 
     try:
-        # Ensure MCP server is running
-        _ensure_mcp_server()
+        # Ensure MCP server is running with the correct LLM config
+        llm_config = job.get('llm_config') or {}
+        _ensure_mcp_server(llm_config)
+
+        # Clear sensitive tokens from DB (same as auto mode)
+        sensitive_keys = {'api_key', 'codex_token', 'base_url'}
+        if any(llm_config.get(k) for k in sensitive_keys):
+            try:
+                safe_config = {k: v for k, v in llm_config.items() if k not in sensitive_keys}
+                supabase.table('simulations').update(
+                    {'llm_config': safe_config if safe_config else None}
+                ).eq('id', job_id).execute()
+                logger.info(f"Job {job_id}: cleared sensitive tokens from database")
+            except Exception as e:
+                logger.warning(f"Job {job_id}: failed to clear tokens from DB: {e}")
 
         # Determine which stage to execute based on current pipeline_stage
         if pipeline_stage is None:

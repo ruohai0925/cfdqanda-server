@@ -42,16 +42,30 @@ class MCPServerManager:
         self.port = port
         self.conda_env = conda_env
         self._process: Optional[subprocess.Popen] = None
+        self._current_llm_env: Optional[Dict[str, str]] = None
 
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/mcp"
 
-    def start(self, timeout: float = 30.0) -> None:
-        """Start MCP server as a subprocess and wait until ready."""
+    def start(self, timeout: float = 30.0, llm_env: Optional[Dict[str, str]] = None) -> None:
+        """Start MCP server as a subprocess and wait until ready.
+
+        Args:
+            timeout: Seconds to wait for server readiness.
+            llm_env: LLM-specific env vars (FOAMAGENT_MODEL_PROVIDER, etc.)
+                     to inject into the subprocess. If the running server was
+                     started with different llm_env, it is restarted.
+        """
+        # Restart if LLM config changed (e.g. switching from platform default to BYOK)
         if self._process and self._process.poll() is None:
-            logger.info("MCP server already running (pid=%d)", self._process.pid)
-            return
+            if llm_env == self._current_llm_env:
+                logger.info("MCP server already running with matching LLM config (pid=%d)",
+                            self._process.pid)
+                return
+            else:
+                logger.info("MCP server LLM config changed, restarting...")
+                self.stop()
 
         # Use bash -c to cd into Foam-Agent dir before launching,
         # because conda run doesn't always honor Popen's cwd.
@@ -66,7 +80,15 @@ class MCPServerManager:
         from worker import _build_subprocess_env
         clean_env = _build_subprocess_env()
 
-        logger.info("Starting MCP server: %s", server_cmd)
+        # Inject LLM-specific env vars so Foam-Agent's Config picks up
+        # the correct provider/model instead of defaulting to openai-codex
+        if llm_env:
+            clean_env.update(llm_env)
+
+        self._current_llm_env = llm_env
+        logger.info("Starting MCP server: %s (llm_env=%s)", server_cmd,
+                     {k: ('***' if 'KEY' in k or 'TOKEN' in k else v)
+                      for k, v in (llm_env or {}).items()})
         self._process = subprocess.Popen(
             ["bash", "-c", server_cmd],
             stdout=subprocess.PIPE,

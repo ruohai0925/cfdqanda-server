@@ -250,6 +250,7 @@ curl localhost:8000/api/v1/admin/status
 
 ### 2026-03-29
 
+- **新增重型仿真 prompt 预检**（`worker.py`）：`_check_prompt()` 新增检测 LES、DES、DPM、FWH/声学、FSI、反应流和 3D VOF 等关键词，命中时注入 `[PLATFORM NOTE]` 警告 Foam-Agent 使用粗网格和 `purgeWrite`，避免超出磁盘/内存限制。
 - **Codex token 过期邮件告警**：配置 `msmtp` + Gmail SMTP + 每日 cron（`codex-token-sync.sh check --cron`），token 过期前 2 天发邮件提醒。登录仍需手动浏览器交互（`./codex-token-sync.sh login`）。
 - **修正 cron 路径**：旧 cron 指向错误目录（`cfdqanda-server/`），已修正到项目根目录（`cfdqanda/`）。
 - **更新 Foam-Agent 微信社区说明**：将 "maintainer" 改为 "volunteer"，添加微信号作为扫码入群的替代方式（[PR #24](https://github.com/csml-rpi/Foam-Agent/pull/24)）。
