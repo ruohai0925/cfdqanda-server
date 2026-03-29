@@ -213,64 +213,17 @@ curl localhost:8000/api/v1/admin/status
 
 With UptimeRobot configured, step 1 is automated — you get an email alert when something goes wrong, and another when it recovers.
 
-## Codex Token Management
+## Maintenance Log / 维护日志
 
-Codex OAuth tokens expire every ~10 days and require interactive browser login to refresh. A cron job checks daily and sends an email alert 2 days before expiry.
+### 2026-03-29
 
-Codex OAuth token 约每 10 天过期，需要浏览器交互登录刷新。通过 cron 每日检查，过期前 2 天发邮件提醒。
+- **Codex token expiry email alert**: Set up `msmtp` + Gmail SMTP + daily cron (`codex-token-sync.sh check --cron`) to send email alert 2 days before token expires. Login still requires manual browser interaction (`./codex-token-sync.sh login`).
 
-### Setup email alerts / 设置邮件告警
+  **Codex token 过期邮件告警**：配置 `msmtp` + Gmail SMTP + 每日 cron（`codex-token-sync.sh check --cron`），token 过期前 2 天发邮件提醒。登录仍需手动浏览器交互（`./codex-token-sync.sh login`）。
 
-1. Install msmtp / 安装 msmtp:
+- **Fixed cron job path**: Previous cron pointed to wrong directory (`cfdqanda-server/codex-token-sync.sh`), corrected to project root (`cfdqanda/codex-token-sync.sh`).
 
-```bash
-sudo apt-get install msmtp msmtp-mta
-```
-
-2. Configure Gmail SMTP (`~/.msmtprc`, chmod 600) / 配置 Gmail SMTP：
-
-```
-defaults
-auth           on
-tls            on
-tls_trust_file /etc/ssl/certs/ca-certificates.crt
-logfile        ~/.msmtp.log
-
-account        gmail
-host           smtp.gmail.com
-port           587
-from           your-sender@gmail.com
-user           your-sender@gmail.com
-password       <Gmail App Password>
-
-account default : gmail
-```
-
-> Generate an App Password at https://myaccount.google.com/apppasswords (requires 2FA enabled).
->
-> 在 https://myaccount.google.com/apppasswords 生成 App Password（需开启两步验证）。
-
-3. Add cron job / 添加定时任务:
-
-```bash
-crontab -e
-# Add this line — checks at 09:00 daily, emails only when token is expiring
-# 添加此行 — 每天 09:00 检查，仅在 token 即将过期时发邮件
-0 9 * * * out=$(/path/to/codex-token-sync.sh check --cron 2>&1); [ -n "$out" ] && echo -e "Subject: [Alert] Codex Token Expiring\n\n$out" | msmtp your-recipient@gmail.com
-```
-
-### Manual refresh / 手动刷新
-
-```bash
-# Check token status (local + GCP) / 检查 token 状态
-./codex-token-sync.sh check
-
-# Interactive login + auto-sync to GCP + restart workers / 交互式登录 + 自动同步 GCP + 重启 worker
-./codex-token-sync.sh login
-
-# Sync only (no login) / 仅同步（不登录）
-./codex-token-sync.sh sync
-```
+  **修正 cron 路径**：旧 cron 指向错误目录（`cfdqanda-server/`），已修正到项目根目录。
 
 ## Tests
 
