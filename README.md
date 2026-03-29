@@ -213,17 +213,12 @@ curl localhost:8000/api/v1/admin/status
 
 With UptimeRobot configured, step 1 is automated — you get an email alert when something goes wrong, and another when it recovers.
 
-## Maintenance Log / 维护日志
+## Maintenance Log
 
 ### 2026-03-29
 
 - **Codex token expiry email alert**: Set up `msmtp` + Gmail SMTP + daily cron (`codex-token-sync.sh check --cron`) to send email alert 2 days before token expires. Login still requires manual browser interaction (`./codex-token-sync.sh login`).
-
-  **Codex token 过期邮件告警**：配置 `msmtp` + Gmail SMTP + 每日 cron（`codex-token-sync.sh check --cron`），token 过期前 2 天发邮件提醒。登录仍需手动浏览器交互（`./codex-token-sync.sh login`）。
-
 - **Fixed cron job path**: Previous cron pointed to wrong directory (`cfdqanda-server/codex-token-sync.sh`), corrected to project root (`cfdqanda/codex-token-sync.sh`).
-
-  **修正 cron 路径**：旧 cron 指向错误目录（`cfdqanda-server/`），已修正到项目根目录。
 
 ## Tests
 

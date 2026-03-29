@@ -246,6 +246,13 @@ curl localhost:8000/api/v1/admin/status
 
 配置 UptimeRobot 后，第 1 步由机器自动完成 —— 发现异常发邮件通知，恢复后也会通知。
 
+## 维护日志
+
+### 2026-03-29
+
+- **Codex token 过期邮件告警**：配置 `msmtp` + Gmail SMTP + 每日 cron（`codex-token-sync.sh check --cron`），token 过期前 2 天发邮件提醒。登录仍需手动浏览器交互（`./codex-token-sync.sh login`）。
+- **修正 cron 路径**：旧 cron 指向错误目录（`cfdqanda-server/`），已修正到项目根目录（`cfdqanda/`）。
+
 ## 测试
 
 ```bash
