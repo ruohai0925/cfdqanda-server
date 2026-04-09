@@ -751,13 +751,24 @@ _PLATFORM_NOTE = (
     "Use purgeWrite to limit stored timesteps. "
     # === v10 syntax gotchas (always relevant, low cost to include) ===
     "v10 syntax notes: use 'stopAt endTime' (not 'stopAt maxClockTime'); "
-    "use 'Gauss upwind' (not 'bounded Gauss ...'); "
-    "for compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.), "
-    "wall function patch types require the 'compressible::' namespace prefix "
+    "use 'Gauss upwind' (not 'bounded Gauss ...'). "
+    # Compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.) — these
+    # are the most common LLM blind spots. Verified empirically across Tasks
+    # 433/443/458/459 (buoyantFoam) — listing the exact required entries here
+    # is the only reliable way to get the LLM to include them.
+    "For compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.): "
+    "(1) wall function patch types require the 'compressible::' namespace prefix "
     "(e.g. 'compressible::alphatJayatillekeWallFunction', NOT 'alphatWallFunction'); "
-    "in fvSolution.solvers always include final-iteration entries for PIMPLE "
+    "(2) fvSolution.solvers MUST include final-iteration entries for PIMPLE "
     "(rhoFinal, pFinal, p_rghFinal, UFinal, hFinal, kFinal, epsilonFinal, TFinal "
-    "as applicable) — they can inherit base settings via $rho-style references."
+    "as applicable) — they can inherit base settings via $rho-style references; "
+    "(3) fvSchemes.divSchemes MUST include the kinetic-energy and total-energy "
+    "projection terms 'div(phi,K) Gauss linear' and 'div(phi,Ekp) Gauss linear' "
+    "(K = 0.5*|U|^2, Ekp = total energy) — these are silently required by the "
+    "solver and missing them causes 'div(phi,K) is undefined' errors at runtime. "
+    "Reference the canonical entries by reading "
+    "$WM_PROJECT_DIR/tutorials/heatTransfer/buoyantFoam/hotRoom/system/fvSchemes "
+    "if unsure."
 )
 
 
