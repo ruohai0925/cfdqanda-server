@@ -729,46 +729,34 @@ _CONVERGENCE_RE = _re.compile(
 )
 
 # Platform capabilities note — always appended so Foam-Agent knows constraints.
-# IMPORTANT: keep the v10 syntax notes here. They were previously buried inside
-# the version-mismatch warning, which only fired by accident on prompts that
-# happened to contain a number after "of" (e.g. "temperature of 300K"). Task
-# 433 vs 434 root-cause analysis showed that the LLM picks the wrong wall
-# function patch type without these explicit hints.
+# v10 syntax + compressible thermal gotchas verified empirically against Tasks
+# 433/443/458/459/465 (buoyantFoam). Each line is here because removing it
+# caused a real failure on a real user task — keep it terse but don't trim.
 _PLATFORM_NOTE = (
     "[PLATFORM CONSTRAINTS] "
-    "OpenFOAM v10 (not v11/v12/v13 — use v10-compatible API and syntax). "
-    "Single-core only — do NOT use decomposePar or runParallel. "
-    "All simulations must run in serial mode. "
-    "After meshing, check cell count — if > 2 million cells, "
-    "warn user and consider coarsening the mesh. "
-    "snappyHexMesh is supported with built-in searchable geometries "
-    "(searchableBox, searchableCylinder, searchableSphere, etc.), "
-    "but NO STL file generation capability — if complex geometry requires "
-    "an STL that cannot be described by searchable primitives, "
-    "report that user must upload a custom mesh (.msh). "
-    "Users can upload Gmsh .msh files via --custom_mesh_path. "
-    f"Max output size: {{}}" "MB. "  # filled at runtime
-    "Use purgeWrite to limit stored timesteps. "
-    # === v10 syntax gotchas (always relevant, low cost to include) ===
-    "v10 syntax notes: use 'stopAt endTime' (not 'stopAt maxClockTime'); "
-    "use 'Gauss upwind' (not 'bounded Gauss ...'). "
-    # Compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.) — these
-    # are the most common LLM blind spots. Verified empirically across Tasks
-    # 433/443/458/459 (buoyantFoam) — listing the exact required entries here
-    # is the only reliable way to get the LLM to include them.
-    "For compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.): "
-    "(1) wall function patch types require the 'compressible::' namespace prefix "
-    "(e.g. 'compressible::alphatJayatillekeWallFunction', NOT 'alphatWallFunction'); "
-    "(2) fvSolution.solvers MUST include final-iteration entries for PIMPLE "
-    "(rhoFinal, pFinal, p_rghFinal, UFinal, hFinal, kFinal, epsilonFinal, TFinal "
-    "as applicable) — they can inherit base settings via $rho-style references; "
-    "(3) fvSchemes.divSchemes MUST include the kinetic-energy and total-energy "
-    "projection terms 'div(phi,K) Gauss linear' and 'div(phi,Ekp) Gauss linear' "
-    "(K = 0.5*|U|^2, Ekp = total energy) — these are silently required by the "
-    "solver and missing them causes 'div(phi,K) is undefined' errors at runtime. "
-    "Reference the canonical entries by reading "
-    "$WM_PROJECT_DIR/tutorials/heatTransfer/buoyantFoam/hotRoom/system/fvSchemes "
-    "if unsure."
+    "OpenFOAM v10 — use v10 API and syntax (not v11/v12/v13). "
+    "Single-core serial only — no decomposePar / runParallel. "
+    "Mesh: warn if > 2M cells. "
+    "snappyHexMesh OK with searchable primitives (Box/Cylinder/Sphere/etc.), "
+    "but NO STL generation — if needed, ask user to upload a Gmsh .msh. "
+    f"Max output: {{}}" "MB; use purgeWrite. "
+    # v10 syntax (always)
+    "v10: 'stopAt endTime' (not maxClockTime); 'Gauss upwind' (not 'bounded Gauss'). "
+    # Initial conditions: avoid #codeStream (sandboxed root user blocks runtime
+    # C++ compilation — see Foam-Agent-Comments.md §6).
+    "Non-uniform initial conditions: use setFields + setFieldsDict. "
+    "Do NOT use #codeStream — runtime C++ compilation is blocked in this sandbox. "
+    # Compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.).
+    "Compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.) require: "
+    "(1) wall function patch types with 'compressible::' prefix "
+    "(e.g. compressible::alphatJayatillekeWallFunction, NOT alphatWallFunction); "
+    "(2) fvSolution.solvers final-iteration entries for PIMPLE "
+    "(rhoFinal, pFinal, p_rghFinal, UFinal, hFinal, kFinal, epsilonFinal, TFinal as applicable); "
+    "(3) fvSchemes.divSchemes MUST include 'div(phi,K) Gauss linear' and "
+    "'div(phi,Ekp) Gauss linear' (kinetic / total energy projection); "
+    "(4) the turbulence dissipation div term uses the COMPRESSIBLE form "
+    "'div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear' "
+    "(NOT the incompressible 'div((muEff*dev2(T(grad(U)))))')."
 )
 
 
