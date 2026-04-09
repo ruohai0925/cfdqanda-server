@@ -191,31 +191,151 @@ def generate(args):
             p(f"\n总 token 消耗：{token_total:,}\n")
 
     # ============================================================
-    # 3. 用户反馈
+    # 3. 用户反馈（全部层面）
     # ============================================================
+    # Sources collected:
+    #   (a) simulations.user_rating + user_comment    (task-level rating)
+    #   (b) simulations.stage_ratings                 (per-stage rating, controlled mode)
+    #   (c) pipeline_state.stage_feedback             (confirm/reject + optional comment)
+    #   (d) platform_feedback table                   (modal "feedback" button)
+    #   (e) Storage *_feedback files                  (per-file feedback from review UI)
+    # 1 = success, 2 = partial, 3 = failed (matches FileBrowser.jsx rating buttons)
+    rating_labels = {1: "成功 ✅", 2: "部分成功 ⚠️", 3: "失败 ❌"}
+
     rated = [t for t in tasks if t.get("user_rating")]
     commented = [t for t in tasks if t.get("user_comment")]
+
+    # (b) per-stage ratings — jsonb column on simulations
+    stage_rated = []
+    for t in tasks:
+        sr = t.get("stage_ratings") or {}
+        if isinstance(sr, dict) and sr:
+            for stage, info in sr.items():
+                if isinstance(info, dict) and (info.get("rating") or info.get("comment")):
+                    stage_rated.append({
+                        "id": t["id"],
+                        "user": user_map.get(t["user_id"], "?"),
+                        "stage": stage,
+                        "rating": info.get("rating"),
+                        "comment": info.get("comment", ""),
+                    })
+
+    # (c) stage_feedback — found in pipeline_state, NOT result_data
     stage_fbs = []
     for t in tasks:
-        rd = t.get("result_data") or {}
-        for fb in (rd.get("stage_feedback") or []):
-            if fb.get("comment"):
-                stage_fbs.append({"id": t["id"], "user": user_map.get(t["user_id"], "?"), **fb})
+        ps = t.get("pipeline_state") or {}
+        for fb in (ps.get("stage_feedback") or []):
+            stage_fbs.append({
+                "id": t["id"],
+                "user": user_map.get(t["user_id"], "?"),
+                "stage": fb.get("stage", "?"),
+                "action": fb.get("action", "?"),
+                "comment": fb.get("comment", ""),
+                "timestamp": fb.get("timestamp", ""),
+            })
 
-    if rated or commented or stage_fbs:
+    # (d) platform_feedback — modal feedback button
+    platform_fbs = []
+    try:
+        pf_rows = sb.table("platform_feedback").select("*").gte(
+            "created_at", since.isoformat()
+        ).order("created_at").execute().data
+        for row in pf_rows:
+            platform_fbs.append({
+                "user": user_map.get(row["user_id"], row["user_id"][:16]),
+                "content": row.get("content", ""),
+                "timestamp": row.get("created_at", "")[:16],
+            })
+    except Exception as e:
+        p(f"<!-- platform_feedback query failed: {e} -->\n")
+
+    # (e) per-file feedback in Storage
+    file_fbs = []
+    bucket = sb.storage.from_("simulation_results")
+    for t in tasks:
+        base = f"public/{t['user_id']}/{t['id']}"
+        try:
+            def walk(prefix, depth=0):
+                if depth > 3:
+                    return
+                try:
+                    items = bucket.list(prefix, options={"limit": 200})
+                except Exception:
+                    return
+                for it in items:
+                    name = it.get("name")
+                    if not name:
+                        continue
+                    full = f"{prefix}/{name}"
+                    if it.get("id") is None:
+                        walk(full, depth + 1)
+                    elif name.endswith("_feedback"):
+                        try:
+                            content = bucket.download(full).decode("utf-8", errors="replace")
+                            file_fbs.append({
+                                "id": t["id"],
+                                "user": user_map.get(t["user_id"], "?"),
+                                "path": full.replace(base + "/", ""),
+                                "content": content,
+                            })
+                        except Exception:
+                            pass
+            walk(base)
+        except Exception:
+            pass
+
+    has_any = rated or commented or stage_rated or stage_fbs or platform_fbs or file_fbs
+    if has_any:
         p(f"\n## 用户反馈\n\n")
-        rating_labels = {1: "成功 ✅", 2: "部分成功 ⚠️", 3: "失败 ❌"}
-        for t in rated:
-            email = user_map.get(t["user_id"], "?")
-            label = rating_labels.get(t["user_rating"], "?")
-            p(f"- **Task {t['id']}** ({email}): {label}")
-            if t.get("user_comment"):
-                p(f" — {t['user_comment']}")
+        if rated or commented:
+            p(f"### 任务级评分（user_rating + user_comment）\n\n")
+            for t in rated:
+                email = user_map.get(t["user_id"], "?")
+                label = rating_labels.get(t["user_rating"], f"rating={t['user_rating']}")
+                p(f"- **Task {t['id']}** ({email}): {label}")
+                if t.get("user_comment"):
+                    p(f" — _{t['user_comment']}_")
+                p(f"\n")
+            # Rated-only and commented-only have overlap; show comments without rating separately
+            commented_only = [t for t in commented if not t.get("user_rating")]
+            for t in commented_only:
+                email = user_map.get(t["user_id"], "?")
+                p(f"- **Task {t['id']}** ({email}): _{t['user_comment']}_\n")
             p(f"\n")
-        for fb in stage_fbs:
-            p(f"- **Task {fb['id']}** ({fb['user']}): {fb.get('stage','?')} {fb.get('action','?')} — {fb['comment']}\n")
+        if stage_rated:
+            p(f"### 阶段级评分（controlled 模式 stage_ratings）\n\n")
+            for fb in stage_rated:
+                label = rating_labels.get(fb["rating"], f"rating={fb['rating']}")
+                p(f"- **Task {fb['id']}** ({fb['user']}) · `{fb['stage']}` → {label}")
+                if fb["comment"]:
+                    p(f" — _{fb['comment']}_")
+                p(f"\n")
+            p(f"\n")
+        if stage_fbs:
+            p(f"### 阶段确认/拒绝事件（pipeline_state.stage_feedback）\n\n")
+            for fb in stage_fbs:
+                marker = "✓" if fb["action"] == "confirm" else "✗"
+                p(f"- **Task {fb['id']}** ({fb['user']}) · `{fb['stage']}` {marker} {fb['action']}")
+                if fb["comment"]:
+                    p(f" — _{fb['comment']}_")
+                p(f"\n")
+            p(f"\n")
+        if platform_fbs:
+            p(f"### 平台级反馈（feedback 模态窗）\n\n")
+            for fb in platform_fbs:
+                p(f"- **{fb['timestamp']}** ({fb['user']}):\n")
+                for line in fb["content"].splitlines():
+                    p(f"  > {line}\n")
+            p(f"\n")
+        if file_fbs:
+            p(f"### 文件级反馈（_feedback 文件）\n\n")
+            for fb in file_fbs:
+                p(f"- **Task {fb['id']}** ({fb['user']}) · `{fb['path']}`:\n")
+                for line in fb["content"][:500].splitlines():
+                    p(f"  > {line}\n")
+            p(f"\n")
     else:
-        p(f"\n## 用户反馈\n\n该时间段内无评分或反馈。\n")
+        p(f"\n## 用户反馈\n\n该时间段内无任何反馈。\n")
 
     # ============================================================
     # 4. 用户概览

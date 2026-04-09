@@ -79,7 +79,13 @@ _bound_pipeline_job_id = None
 # Timestamp (UTC) when the bound job entered its current checkpoint.
 _bound_checkpoint_since = None
 # How long (seconds) to wait for user confirmation before auto-failing.
-CHECKPOINT_TIMEOUT = int(os.environ.get("CHECKPOINT_TIMEOUT", "1800"))  # 30 min
+# 2 hours: users may need time to inspect generated files before confirming.
+CHECKPOINT_TIMEOUT = int(os.environ.get("CHECKPOINT_TIMEOUT", "7200"))  # 2 h
+
+# Max review→fix iterations in controlled-mode pre-run before giving up.
+# 8 chosen after observing real failures (jobs 433/443) where 5 iterations
+# weren't enough for the LLM to converge on dictionary/boundary-field fixes.
+PRE_RUN_MAX_FIX_ATTEMPTS = int(os.environ.get("PRE_RUN_MAX_FIX_ATTEMPTS", "8"))
 
 # --- Middleware directory configuration ---
 MIDDLEWARE_DIR = os.environ.get("MIDDLEWARE_DIR")
@@ -177,21 +183,22 @@ def _sanitize_log_file(log_path):
         logger.warning(f"Failed to sanitize log file {log_path}: {e}")
 
 
-def _diagnose_subprocess_failure(log_path, effective_provider):
-    """Scan simulation log for known error patterns and return a user-friendly message.
+def _diagnose_error_text(text, effective_provider, is_byok=False):
+    """Match known error patterns in arbitrary text and return a user-friendly message.
+
+    Args:
+        text: Error text to scan (log content or exception message).
+        effective_provider: Provider name after BYOK→openai mapping (e.g. 'openai', 'openai-codex').
+        is_byok: True if user supplied their own API key / Codex token. Used to
+            tailor the error message: BYOK users see "your key invalid", platform
+            default users see "platform unavailable".
 
     Returns a tuple (user_message, error_category) or (None, None) if no known
     pattern is detected.
     """
-    if not log_path or not os.path.isfile(log_path):
+    if not text:
         return None, None
-    try:
-        with open(log_path, 'r', errors='replace') as f:
-            content = f.read()
-    except Exception:
-        return None, None
-
-    lower = content.lower()
+    lower = text.lower()
 
     # Rate limit / quota exceeded (OpenAI, Codex, Anthropic, DeepSeek)
     if any(p in lower for p in [
@@ -199,7 +206,7 @@ def _diagnose_subprocess_failure(log_path, effective_provider):
         'too many requests', 'quota exceeded', 'insufficient_quota',
         'you exceeded your current quota',
     ]):
-        if effective_provider == 'openai-codex':
+        if effective_provider == 'openai-codex' and not is_byok:
             return (
                 "Platform Codex quota temporarily exhausted. "
                 "It resets every few hours — please wait and try again, or use BYOK with your own API key."
@@ -214,13 +221,44 @@ def _diagnose_subprocess_failure(log_path, effective_provider):
     if any(p in lower for p in [
         'authenticationerror', 'invalid api key', 'invalid_api_key',
         'incorrect api key', 'unauthorized', 'http 401', 'status 401',
-        'error code: 401', '401 unauthorized',
+        'error code: 401', '401 unauthorized', 'token_expired',
     ]):
+        if is_byok:
+            # User-provided credential is the problem
+            if effective_provider == 'openai-codex':
+                return (
+                    "Your Codex OAuth token is invalid or expired. "
+                    "Codex tokens expire every ~10 days — please re-authenticate and try again, "
+                    "or switch to BYOK with a regular API key (OpenAI / Anthropic / DeepSeek)."
+                ), 'auth_error_byok'
+            return (
+                "Your API key is invalid or expired. "
+                "Please verify the key in your provider's dashboard and resubmit."
+            ), 'auth_error_byok'
+        # Platform default credential is the problem
         return (
-            "LLM API authentication failed. Please check your API key."
-        ), 'auth_error'
+            "Platform default model is temporarily unavailable (authentication failed). "
+            "The administrator has been notified. "
+            "Meanwhile you can use BYOK with your own API key to keep working."
+        ), 'auth_error_platform'
 
     return None, None
+
+
+def _diagnose_subprocess_failure(log_path, effective_provider, is_byok=False):
+    """Scan a subprocess log file for known error patterns.
+
+    Thin wrapper around _diagnose_error_text() that loads the file first.
+    Returns (user_message, error_category) or (None, None).
+    """
+    if not log_path or not os.path.isfile(log_path):
+        return None, None
+    try:
+        with open(log_path, 'r', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        return None, None
+    return _diagnose_error_text(content, effective_provider, is_byok)
 
 
 # --- 2. 辅助函数：文件树构建和上传 ---
@@ -673,8 +711,13 @@ import re as _re
 
 # OpenFOAM version patterns: "openfoam 13", "OF13", "openfoam v13", "of 13", etc.
 # We detect versions that are NOT v10 (the platform version).
+# Must require the full word "openfoam" — bare "of" matches noisy phrases like
+# "of 300K" / "Reynolds of 4000" / "molWeight of 28.9" and produces false
+# positives that previously hid the lack of platform-note injection in
+# controlled mode (see Task 433/434 root-cause analysis).
+# Limit to 1-2 digit versions (OF Foundation goes up to v13 currently).
 _OF_VERSION_RE = _re.compile(
-    r'(?:openfoam|of)\s*(?:v|version\s*)?(\d+)',
+    r'\bopenfoam[-\s_]*(?:v|version\s*)?(\d{1,2})(?!\d)',
     _re.IGNORECASE
 )
 
@@ -686,6 +729,11 @@ _CONVERGENCE_RE = _re.compile(
 )
 
 # Platform capabilities note — always appended so Foam-Agent knows constraints.
+# IMPORTANT: keep the v10 syntax notes here. They were previously buried inside
+# the version-mismatch warning, which only fired by accident on prompts that
+# happened to contain a number after "of" (e.g. "temperature of 300K"). Task
+# 433 vs 434 root-cause analysis showed that the LLM picks the wrong wall
+# function patch type without these explicit hints.
 _PLATFORM_NOTE = (
     "[PLATFORM CONSTRAINTS] "
     "OpenFOAM v10 (not v11/v12/v13 — use v10-compatible API and syntax). "
@@ -700,7 +748,16 @@ _PLATFORM_NOTE = (
     "report that user must upload a custom mesh (.msh). "
     "Users can upload Gmsh .msh files via --custom_mesh_path. "
     f"Max output size: {{}}" "MB. "  # filled at runtime
-    "Use purgeWrite to limit stored timesteps."
+    "Use purgeWrite to limit stored timesteps. "
+    # === v10 syntax gotchas (always relevant, low cost to include) ===
+    "v10 syntax notes: use 'stopAt endTime' (not 'stopAt maxClockTime'); "
+    "use 'Gauss upwind' (not 'bounded Gauss ...'); "
+    "for compressible thermal solvers (buoyantFoam, rhoPimpleFoam, etc.), "
+    "wall function patch types require the 'compressible::' namespace prefix "
+    "(e.g. 'compressible::alphatJayatillekeWallFunction', NOT 'alphatWallFunction'); "
+    "in fvSolution.solvers always include final-iteration entries for PIMPLE "
+    "(rhoFinal, pFinal, p_rghFinal, UFinal, hFinal, kFinal, epsilonFinal, TFinal "
+    "as applicable) — they can inherit base settings via $rho-style references."
 )
 
 
@@ -762,6 +819,14 @@ def _check_prompt(prompt, job_id):
         ('FWH/acoustics', r'\bfwh\b|ffowcs|acoustic|噪声仿真|声压'),
         ('FSI', r'\bfsi\b|fluid.structure|流固耦合|solids4foam'),
         ('reacting flow', r'reactingfoam|反应流|supercritical.*water.*oxidation|scwo'),
+        # RSM (Reynolds Stress Model): solves 6 transport equations + e/omega,
+        # heavier than k-eps/k-omega and prone to convergence issues. Job 445
+        # (Stairmand cyclone with RSM) hit OOM after uploading 195 MB.
+        ('RSM (Reynolds Stress)', r'\brsm\b|reynolds.{0,3}stress|雷诺应力|launder.*reynolds'),
+        # Cyclone separators: high aspect ratio + swirling flow → typically
+        # large cell counts and slow convergence. Stairmand geometry is the
+        # canonical example.
+        ('cyclone separator', r'cyclone.{0,5}separat|stairmand|旋风分离|cyclonic.{0,5}separat'),
     ]
     heavy_matches = []
     for label, pattern in _heavy_keywords:
@@ -1352,6 +1417,31 @@ def _handle_controlled_pipeline(job):
     pipeline_state = job.get('pipeline_state') or {}
     pipeline_stage = job.get('pipeline_stage')
     active_checkpoints = pipeline_state.get('active_checkpoints', [])
+    # Defined here so the exception handler can diagnose auth/quota errors
+    # using BYOK status and provider info.
+    llm_config = job.get('llm_config') or {}
+    is_byok = bool(llm_config.get('api_key') or llm_config.get('codex_token'))
+    effective_provider = llm_config.get('model_provider') or 'openai-codex'
+    if effective_provider in ('deepseek', 'qwen'):
+        effective_provider = 'openai'
+
+    # Augmented prompt: raw user prompt + [PLATFORM NOTE] constraints.
+    # Auto mode does this in _process_job() (line 2143). Controlled mode used
+    # to bypass this entirely, leaving the LLM with no v10 / single-core /
+    # wall-function-namespace context — which is exactly how Task 433 ended up
+    # generating 'alphatWallFunction' instead of the namespace-prefixed v10
+    # form. We compute it once on first touch and stash on pipeline_state so
+    # subsequent stages (after checkpoints) can reuse it without recomputing.
+    augmented_prompt = pipeline_state.get('augmented_prompt')
+    if not augmented_prompt:
+        prompt_warnings = _check_prompt(job['prompt'], job_id)
+        if prompt_warnings:
+            augmented_prompt = job['prompt'] + "\n\n" + "\n".join(
+                f"[PLATFORM NOTE] {w['message']}" for w in prompt_warnings
+            )
+        else:
+            augmented_prompt = job['prompt']
+        pipeline_state['augmented_prompt'] = augmented_prompt
 
     logger.info(f"Job {job_id}: controlled pipeline, stage={pipeline_stage}")
 
@@ -1366,7 +1456,6 @@ def _handle_controlled_pipeline(job):
 
     # Write task_settings.json and download mesh for new jobs (first stage only)
     if pipeline_stage is None:
-        llm_config = job.get('llm_config') or {}
         run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
         os.makedirs(run_dir, exist_ok=True)
 
@@ -1408,7 +1497,7 @@ def _handle_controlled_pipeline(job):
 
     try:
         # Ensure MCP server is running with the correct LLM config
-        llm_config = job.get('llm_config') or {}
+        # (llm_config defined at function top so exception handler can use it)
         _ensure_mcp_server(llm_config)
 
         # Clear sensitive tokens from DB (same as auto mode)
@@ -1446,9 +1535,19 @@ def _handle_controlled_pipeline(job):
     except Exception as e:
         logger.error(f"Job {job_id}: controlled pipeline error: {e}", exc_info=True)
         run_dir = pipeline_state.get('case_dir') or os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
-        _upload_and_fail(job_id, job['user_id'],
-                         f"Pipeline error at stage '{pipeline_stage}': {str(e)}",
+        # Diagnose known LLM auth/quota errors so users get an actionable message
+        # instead of a raw stack trace.
+        diagnosed_msg, diagnosed_cat = _diagnose_error_text(str(e), effective_provider, is_byok)
+        if diagnosed_msg:
+            logger.info(f"Job {job_id}: diagnosed controlled-mode failure as '{diagnosed_cat}'")
+            error_msg = diagnosed_msg
+            extra_result = {'error_category': diagnosed_cat}
+        else:
+            error_msg = f"Pipeline error at stage '{pipeline_stage}': {str(e)}"
+            extra_result = None
+        _upload_and_fail(job_id, job['user_id'], error_msg,
                          run_dir=run_dir,
+                         extra_result=extra_result,
                          extra_fields={'pipeline_stage': pipeline_stage})
 
     # --- Check if job reached a terminal state → release the lock ---
@@ -1485,8 +1584,12 @@ async def _mcp_stage_plan(job, pipeline_state, active_checkpoints):
 
     _append_mcp_log(job_id, 'plan', 'Starting plan() ...')
 
+    # Use augmented prompt (raw + [PLATFORM NOTE]) computed in
+    # _handle_controlled_pipeline so the LLM sees v10 / namespace constraints.
+    user_prompt = pipeline_state.get('augmented_prompt') or job['prompt']
+
     async with client:
-        plan_result = await client.plan(job['prompt'])
+        plan_result = await client.plan(user_prompt)
 
     # Save plan result into pipeline_state
     pipeline_state.update({
@@ -1527,11 +1630,13 @@ async def _mcp_stage_input_writer(job, pipeline_state, active_checkpoints):
     _update_pipeline_state(job_id, 'generating', 'running', pipeline_state)
     _append_mcp_log(job_id, 'input_writer', 'Starting input_writer() ...')
 
+    user_prompt = pipeline_state.get('augmented_prompt') or job['prompt']
+
     async with client:
         files_result = await client.input_writer(
             case_name=pipeline_state['case_name'],
             subtasks=pipeline_state['subtasks'],
-            user_requirement=job['prompt'],
+            user_requirement=user_prompt,
             case_solver=pipeline_state['case_solver'],
             case_domain=pipeline_state['case_domain'],
             case_category=pipeline_state['case_category'],
@@ -1550,11 +1655,12 @@ async def _mcp_stage_input_writer(job, pipeline_state, active_checkpoints):
     run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
     os.makedirs(run_dir, exist_ok=True)
 
-    # Write prompt file to run_dir for consistency
+    # Write prompt file to run_dir for consistency (use augmented prompt so
+    # debugging matches what the LLM actually saw, mirroring auto mode behavior)
     prompt_path = os.path.join(run_dir, "prompt.txt")
     if not os.path.exists(prompt_path):
         with open(prompt_path, "w") as f:
-            f.write(job['prompt'])
+            f.write(user_prompt)
 
     # Create symlink: runs/{job_id}/output -> case_dir (if not already)
     output_link = os.path.join(run_dir, "output")
@@ -1617,21 +1723,38 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
     logger.info(f"Job {job_id}: starting pre-run (endTime={pre_run_end_time})")
     _append_mcp_log(job_id, 'pre_run', f"Starting pre-run (endTime={pre_run_end_time})")
 
-    max_pre_run_fix_loops = 5
+    max_pre_run_fix_loops = PRE_RUN_MAX_FIX_ATTEMPTS
     pre_run_fix_count = 0
+    prev_errors_signature = None  # used to detect "no progress" loops
+    no_progress_aborted = False
     executor = PreRunExecutor(case_dir, pre_run_end_time)
     checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
 
     # Review+fix loop: if pre-run fails, use MCP review/apply_fixes and retry
     while (not checkpoint_data.get('execution_result', {}).get('success', False)
            and pre_run_fix_count < max_pre_run_fix_loops):
-        pre_run_fix_count += 1
         errors = _collect_case_errors(case_dir)
         if not errors:
             _append_mcp_log(job_id, 'pre_run',
                             f"Pre-run failed but no parseable errors found, cannot auto-fix")
             break
 
+        # Early abort if errors are identical to last iteration — fix loop is
+        # not making progress, more attempts will just waste tokens.
+        # Signature: hash of error contents (ignoring whitespace differences).
+        import hashlib
+        normalized_errors = '\n'.join(' '.join(e.split()) for e in errors)
+        errors_signature = hashlib.md5(normalized_errors.encode()).hexdigest()
+        if prev_errors_signature and errors_signature == prev_errors_signature:
+            _append_mcp_log(job_id, 'pre_run',
+                            f"Errors unchanged after fix attempt {pre_run_fix_count} — "
+                            "stopping fix loop (no progress)")
+            logger.warning(f"Job {job_id}: pre-run fix loop made no progress, aborting early")
+            no_progress_aborted = True
+            break
+        prev_errors_signature = errors_signature
+
+        pre_run_fix_count += 1
         logger.info(f"Job {job_id}: pre-run failed with {len(errors)} errors, "
                     f"review+fix {pre_run_fix_count}/{max_pre_run_fix_loops}")
         _append_mcp_log(job_id, 'pre_run',
@@ -1643,11 +1766,12 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
         from mcp_client import FoamAgentMCPClient
         client = FoamAgentMCPClient(mgr.url)
 
+        user_prompt = pipeline_state.get('augmented_prompt') or job['prompt']
         async with client:
             review_result = await client.review(
                 case_dir=case_dir,
                 errors=errors,
-                user_requirement=job['prompt'],
+                user_requirement=user_prompt,
             )
             analysis = review_result.get('analysis', '')
 
@@ -1655,7 +1779,7 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
                 case_dir=case_dir,
                 error_logs=errors,
                 review_analysis=analysis,
-                user_requirement=job['prompt'],
+                user_requirement=user_prompt,
             )
             _append_mcp_log(job_id, 'pre_run',
                             f"Applied fixes ({fix_result.get('status')}), retrying pre-run")
@@ -1669,14 +1793,30 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
     pipeline_state['pre_run_fix_count'] = pre_run_fix_count
 
     if not checkpoint_data.get('execution_result', {}).get('success', False):
+        if no_progress_aborted:
+            err_label = (
+                f"Pre-run simulation failed: the auto-fix loop made no progress "
+                f"after {pre_run_fix_count} attempts (same errors recurred). "
+                f"Manual intervention needed — please refine your prompt or simplify the case."
+            )
+        else:
+            err_label = (
+                f"Pre-run simulation failed after {pre_run_fix_count} fix attempts. "
+                f"Try a simpler prompt or different solver."
+            )
         _append_mcp_log(job_id, 'pre_run',
-                        f'Pre-run FAILED after {pre_run_fix_count} fix attempts')
-        logger.error(f"Job {job_id}: pre-run failed after {pre_run_fix_count} fix attempts")
+                        f'Pre-run FAILED after {pre_run_fix_count} fix attempts'
+                        + (' (no progress)' if no_progress_aborted else ''))
+        logger.error(f"Job {job_id}: pre-run failed after {pre_run_fix_count} fix attempts"
+                     + (' (early abort: no progress)' if no_progress_aborted else ''))
         _upload_and_fail(
             job_id, job['user_id'],
-            f'Pre-run simulation failed after {pre_run_fix_count} fix attempts.',
+            err_label,
             run_dir=case_dir or os.path.join(FOAM_AGENT_DIR, "runs", str(job_id)),
-            extra_result={'checkpoint_data': checkpoint_data},
+            extra_result={
+                'checkpoint_data': checkpoint_data,
+                'error_category': 'pre_run_no_progress' if no_progress_aborted else 'pre_run_exhausted',
+            },
             extra_fields={'pipeline_stage': 'pre_running'},
         )
         return
@@ -2167,7 +2307,8 @@ def find_and_process_job():
         else:
             logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
             # Diagnose known error patterns from log
-            user_msg, err_cat = _diagnose_subprocess_failure(log_path, effective_provider)
+            is_byok = bool(llm_config.get('api_key') or llm_config.get('codex_token'))
+            user_msg, err_cat = _diagnose_subprocess_failure(log_path, effective_provider, is_byok)
             if user_msg:
                 logger.info(f"Job {job_id}: diagnosed failure as '{err_cat}'")
                 error_msg = user_msg

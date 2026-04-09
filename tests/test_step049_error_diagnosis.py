@@ -135,33 +135,52 @@ class TestDiagnoseSubprocessFailure:
 
     # --- Auth errors ---
 
-    def test_invalid_api_key(self):
-        """'invalid api key' → error_category='auth_error'."""
+    def test_invalid_api_key_platform(self):
+        """'invalid api key' on platform default → 'auth_error_platform'."""
         log = self._write_log(
             "openai.AuthenticationError: Incorrect API key provided: sk-xxx. "
             "You can find your API key at https://platform.openai.com/account/api-keys."
         )
-        msg, cat = self.diagnose(log, 'openai')
-        assert cat == 'auth_error'
-        assert 'API key' in msg
+        msg, cat = self.diagnose(log, 'openai', is_byok=False)
+        assert cat == 'auth_error_platform'
+        assert 'platform' in msg.lower() or 'unavailable' in msg.lower()
+        os.unlink(log)
+
+    def test_invalid_api_key_byok(self):
+        """'invalid api key' on BYOK → 'auth_error_byok'."""
+        log = self._write_log(
+            "openai.AuthenticationError: Incorrect API key provided: sk-xxx."
+        )
+        msg, cat = self.diagnose(log, 'openai', is_byok=True)
+        assert cat == 'auth_error_byok'
+        assert 'API key' in msg or 'key' in msg
         os.unlink(log)
 
     def test_unauthorized_error(self):
-        """HTTP 401 Unauthorized → auth_error."""
+        """HTTP 401 Unauthorized → auth_error_*."""
         log = self._write_log("HTTP Error 401: Unauthorized\nInvalid bearer token")
-        msg, cat = self.diagnose(log, 'openai')
-        assert cat == 'auth_error'
+        msg, cat = self.diagnose(log, 'openai', is_byok=False)
+        assert cat == 'auth_error_platform'
         os.unlink(log)
 
     def test_anthropic_auth_error(self):
-        """Anthropic authentication failure → auth_error."""
+        """Anthropic authentication failure → auth_error_*."""
         log = self._write_log(
             "anthropic.AuthenticationError: authentication failed, "
             "invalid_api_key"
         )
-        msg, cat = self.diagnose(log, 'anthropic')
-        assert cat == 'auth_error'
+        msg, cat = self.diagnose(log, 'anthropic', is_byok=True)
+        assert cat == 'auth_error_byok'
         os.unlink(log)
+
+    def test_codex_token_expired_byok(self):
+        """BYOK Codex token expiry → suggests re-auth and warns about ~10 day expiry."""
+        log = self._write_log(
+            "ChatCompletionResponse: HTTP 401 token_expired"
+        )
+        msg, cat = self.diagnose(log, 'openai-codex', is_byok=True)
+        assert cat == 'auth_error_byok'
+        assert 'Codex' in msg or '10 days' in msg
 
     # --- Unknown / no match ---
 
