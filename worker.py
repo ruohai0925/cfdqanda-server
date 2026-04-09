@@ -1726,6 +1726,8 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
     max_pre_run_fix_loops = PRE_RUN_MAX_FIX_ATTEMPTS
     pre_run_fix_count = 0
     prev_errors_signature = None  # used to detect "no progress" loops
+    no_progress_streak = 0        # consecutive identical-error iterations
+    NO_PROGRESS_BAIL = 2          # bail after this many identical iterations in a row
     no_progress_aborted = False
     executor = PreRunExecutor(case_dir, pre_run_end_time)
     checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
@@ -1739,19 +1741,30 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
                             f"Pre-run failed but no parseable errors found, cannot auto-fix")
             break
 
-        # Early abort if errors are identical to last iteration — fix loop is
-        # not making progress, more attempts will just waste tokens.
-        # Signature: hash of error contents (ignoring whitespace differences).
+        # Early abort if errors stay identical for NO_PROGRESS_BAIL consecutive
+        # iterations — fix loop has stalled, more attempts just waste tokens.
+        # Signature: hash of error contents (whitespace-normalized).
+        # We allow 1 "no change" before bailing on the 2nd, so the LLM gets 2
+        # tries to fix the same error before we give up. Job 458 (buoyantFoam
+        # missing div(phi,K)) showed that 1 attempt is not enough — apply_fixes
+        # may target the wrong file the first time.
         import hashlib
         normalized_errors = '\n'.join(' '.join(e.split()) for e in errors)
         errors_signature = hashlib.md5(normalized_errors.encode()).hexdigest()
         if prev_errors_signature and errors_signature == prev_errors_signature:
-            _append_mcp_log(job_id, 'pre_run',
-                            f"Errors unchanged after fix attempt {pre_run_fix_count} — "
-                            "stopping fix loop (no progress)")
-            logger.warning(f"Job {job_id}: pre-run fix loop made no progress, aborting early")
-            no_progress_aborted = True
-            break
+            no_progress_streak += 1
+            if no_progress_streak >= NO_PROGRESS_BAIL:
+                _append_mcp_log(job_id, 'pre_run',
+                                f"Errors unchanged for {no_progress_streak + 1} consecutive iterations "
+                                f"(after {pre_run_fix_count} fix attempts) — stopping fix loop")
+                logger.warning(
+                    f"Job {job_id}: pre-run fix loop stalled "
+                    f"({no_progress_streak + 1} identical iterations), aborting"
+                )
+                no_progress_aborted = True
+                break
+        else:
+            no_progress_streak = 0
         prev_errors_signature = errors_signature
 
         pre_run_fix_count += 1
