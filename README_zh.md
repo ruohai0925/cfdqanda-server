@@ -248,6 +248,20 @@ curl localhost:8000/api/v1/admin/status
 
 ## 维护日志
 
+### 2026-04-09
+
+- **诊断 controlled mode 系统性弱于 auto mode 的根因**（Tasks 433/443/458/459/465/466/478）：用户 fuadhhasan@RPI 在 Task 433 留言 `"Case 433 failed using the interactive mode; yet case 434 succeeded using the e2e mode."` 直接引出了 4 个互相耦合的 bug。同一 buoyantFoam prompt 在两种 mode 下生成的 `0/alphat`、`system/fvSchemes`、`system/fvSolution` 不同——controlled mode 持续漏写 `compressible::` namespace 前缀、`div(phi,K)`、`div(phi,Ekp)`、以及 compressible 形式的 `div(((rho*nuEff)*dev2(T(grad(U)))))`。
+- **Bug A — `_OF_VERSION_RE` false positive**（`worker.py`）：原正则 `(?:openfoam|of)\s*...(\d+)` 会把 `"temperature of 300K"` 误识为 `OpenFOAM 300`。收紧到 `\bopenfoam[-\s_]*v?(\d{1,2})(?!\d)`，必须出现完整 "openfoam" 词，限定 1-2 位版本号。原 false positive 偶然救了 auto mode（误触发的版本不匹配警告里恰好有 alphat namespace hint），controlled mode 因为根本没调 `_check_prompt`，连这个偶然救命都没有。
+- **Bug B — v10 关键 syntax hint 永久写进 `_PLATFORM_NOTE`**（`worker.py`）：把所有 v10 必须的提示（`compressible::alphatJayatillekeWallFunction` 命名空间、`stopAt endTime`、`Gauss upwind`、PIMPLE 的 `rhoFinal`/`pFinal`/`p_rghFinal` 等终代条目、动能/总能投影项 `div(phi,K)`/`div(phi,Ekp)`、compressible 形式的 `div(((rho*nuEff)*dev2(T(grad(U)))))`、以及禁止 `#codeStream` 因 docker root 阻塞 runtime C++ 编译）从藏在版本警告里改为永久存在于 platform note。Note 从 ~1700 字符紧凑到 1223 字符。
+- **Bug C — controlled mode 现在调用 `_check_prompt`**（`worker.py:_handle_controlled_pipeline`）：原来的 controlled 路径直接把裸 `job['prompt']` 传给 `client.plan()` / `client.input_writer()` / `client.review()` / `client.apply_fixes()`，**完全跳过了 platform note 增强**。修复：在函数顶部一次性计算 `augmented_prompt = job['prompt'] + [PLATFORM NOTE]`，stash 到 `pipeline_state['augmented_prompt']`（jsonb 持久化以便 checkpoint 恢复时复用），4 个 MCP 调用全部用增强版本。Job 458 验证 `pipeline_state.augmented_prompt` 字段已正确填入完整 v10 hint。
+- **Bug D — 已提交上游 [csml-rpi/Foam-Agent#28](https://github.com/csml-rpi/Foam-Agent/pull/28)**：MCP `input_writer` 工具（`fastmcp_server.py`）把 `retrieve_references()` 第 5 个返回值 `similar_case_advice` 用 `_` 丢掉了，导致 MCP 路径生成文件时拿到的上下文比 LangGraph 路径少（auto mode 通过 `state["similar_case_advice"]` 传给 `initial_write()`）。提交了 2 行最小化修复。Merge 之后我们 `_PLATFORM_NOTE` 里的 buoyantFoam-specific hint 大部分可以拆掉。
+- **Pre-run fix loop 改进**（`worker.py:_mcp_stage_pre_run`）：(1) `PRE_RUN_MAX_FIX_ATTEMPTS` 改为环境变量，默认从 5 提升到 8。(2) 新增早停：如果连续 2 次迭代的错误签名完全相同，直接 bail 为 `pre_run_no_progress`，避免浪费 LLM token。(3) 失败信息区分"次数耗尽"和"无进展放弃"。
+- **Checkpoint 超时 30 min → 2 h**（`worker.py`）：`CHECKPOINT_TIMEOUT` 默认值从 1800 改为 7200 秒。Task 444（879329937@qq.com）因为之前 30 分钟超时太激进，用户在 `files_review` 阶段还没看完文件就被自动失败。
+- **Auth error 文案区分 BYOK 和平台默认**（`worker.py:_diagnose_error_text`、`tests/test_step049_error_diagnosis.py`）：原文案 `"LLM API authentication failed. Please check your API key."` 对使用平台默认的用户有误导（他们没有 API key 可以"check"）。新增两种类别：`auth_error_byok`（提示用户 key/token 无效或过期）和 `auth_error_platform`（提示平台默认模型暂时不可用，建议用 BYOK）。重构成 `_diagnose_error_text()` 使 controlled mode 的异常处理也能用上。
+- **`weekly_review.py` 现在收集全部 5 个反馈层**：之前只读 `simulations.user_rating + user_comment`。修复了 `stage_feedback` 字段位置 bug（实际在 `pipeline_state` 不在 `result_data`），新增 `stage_ratings` jsonb 列、`platform_feedback` 表查询、以及 Storage `*_feedback` 文件扫描。捞到了 Task 433 的关键 user comment——本次整个调研的起点。
+- **Codex BYOK token 过期提示**（`AISimulationTab.jsx`）：在 Codex Token 可选输入框下加了警告，说明 Codex OAuth token 每 ~10 天过期、需要重新通过 ChatGPT 客户端登录，建议长期使用选 BYOK 常规 API key。
+- **端到端验证 — Job 478**：复用 Task 433 原 prompt（10×5×10 房间 + 600K 热点的浮力热流）以 auto mode 提交。✅ 成功完成（7 MB 输出，114 个文件，100 秒物理时间）。Platform note 注入 + `#codeStream` 警告的组合修复了原始失败。
+
 ### 2026-03-29
 
 - **BYOK（自带密钥）验证通过**：首个成功的 BYOK 任务（Task 414，openai/gpt-4o）。确认端到端流程正常：前端提交 → Worker 注入环境变量 → Foam-Agent 执行 → 结果上传。API key 在 Worker 读取后正确从数据库清除。
