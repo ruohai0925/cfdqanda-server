@@ -260,7 +260,7 @@ curl localhost:8000/api/v1/admin/status
 - **GitHub Actions 自动 weekly review**（`.github/workflows/weekly_review.yml`）：每周一 09:00 UTC 跑 `weekly_review.py`，报告作为 90 天 artifact 上传，并自动开 labeled GitHub issue。`workflow_dispatch` 手动触发已验证（[run 25353753830](https://github.com/ruohai0925/cfdqanda-server/actions/runs/25353753830)），首个 issue (#1) 自动创建成功。本次事故的直接教训：每周自动检查在跑，就不会出现一个月的盲区。
 - **`check_storage.py` 用户分页 + Storage 真值扫描**：和 `weekly_review.py` 同款分页 bug——之前显示 50 个用户而非 151。更糟：Storage 总用量从 `simulations.result_data.upload_stats.total_bytes` 算，TTL 清空后这字段没了，脚本报 **0 GB** 但实际 **665 MB / 2262 个文件**。改为直接遍历 `simulation_results` bucket 当真值；DB 行还在时交叉显示 status，没有就显示 `(no DB row)`。Storage > 0 但 DB rows = 0 时额外打一行 warning。
 - **运维清理**：清掉本地 805 MB 的孤儿 `runs/{job_id}` 目录（83 个，DB 行早没了——保留 `test-*` 手测目录和 `.gitkeep`）。`docker builder prune -af` 回收 28.96 GB build cache。本地磁盘共回收 ~30 GB。重启了两个 worker replica 让 worker.py 改动生效——启动日志已确认 `Task disk limit set to 1024 MB` 以及 codex token healthcheck 输出。
-- **User Guide 页面嵌入英文平台介绍视频**（`cfdqanda-client/src/UserGuide.jsx`、`App.jsx`）：YouTube 教程（`_Fveasp8QHI`，`t=8` 跳过开头标题画面）通过 `youtube-nocookie` 域名嵌入指南页顶部，lazy-loaded、16:9 自适应 iframe。Footer 链接从 `User Guide` 改为 `User Guide (incl. video)` / `用户指南（含视频）`，让视频从现有入口可发现，不增加新的顶层 UI。
+- **User Guide 页面嵌入英文平台介绍视频**（`cfdqanda-client/src/UserGuide.jsx`、`App.jsx`）：YouTube 教程（`_Fveasp8QHI`）通过 `youtube-nocookie` 域名嵌入指南页顶部，lazy-loaded、16:9 自适应 iframe。Footer 链接从 `User Guide` 改为 `User Guide (incl. video)` / `用户指南（含视频）`，让视频从现有入口可发现，不增加新的顶层 UI。
 - **一次性恢复工具**（不放任何 repo，留在 `cfdqanda/` 父目录）：`rebuild_history.py` 遍历 Storage 重建只读任务索引，DB 没了也能离线参考（恢复了 45 个历史任务）。`system_review.py` 分析同样的数据，输出失败模式和按优先级排序的改进建议——本次维护日志的所有改动都来自它的输出。不 commit，一次性诊断工具。
 
 ### 2026-04-09
