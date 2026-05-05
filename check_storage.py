@@ -247,85 +247,128 @@ def check_supabase(p, detail=False):
         p(f"\n## Supabase\n\n无法连接：{e}\n")
         return
 
+    # User map — paginated. Default per_page=50 was missing emails for >100 users.
     user_map = {}
-    try:
-        for u in sb.auth.admin.list_users():
+    page = 1
+    while True:
+        try:
+            batch = sb.auth.admin.list_users(page=page, per_page=200)
+        except Exception:
+            break
+        if not batch:
+            break
+        for u in batch:
             if hasattr(u, "id"):
                 user_map[u.id] = u.email
-    except Exception:
-        pass
+        if len(batch) < 200:
+            break
+        page += 1
 
     p(f"\n## Supabase（云端数据库 + 文件存储）\n\n")
     p(f"Supabase 是平台的云端后端，提供三项服务：\n")
     p(f"- **数据库（PostgreSQL）**：存储任务记录（`simulations` 表）、用户信息等\n")
     p(f"- **文件存储（Storage）**：存储仿真结果文件（配置文件、日志、时间步数据），用户在前端浏览/下载的文件来自这里\n")
     p(f"- **认证（Auth）**：用户注册登录\n\n")
-    p(f"*下方存储用量基于数据库中记录的 `upload_stats.total_bytes` 估算，秒级查询。*\n")
+    p(f"*下方存储用量直接遍历 `simulation_results` bucket 计算，是真值。*\n")
 
-    resp = sb.table("simulations").select("id, user_id, status, result_data").execute()
-
-    user_stats = {}
+    # Walk Storage directly — DB-derived totals miss orphan dirs that survived
+    # TTL purge of their DB rows (e.g. before storage_base_path was added,
+    # or after the 2026-04-09 incident).
+    bucket = sb.storage.from_("simulation_results")
+    user_storage = {}     # uid -> {'bytes': int, 'task_ids': set, 'tasks': {tid: bytes}}
     grand_total = 0
+    grand_files = 0
 
-    for row in resp.data:
-        uid = row["user_id"]
-        rd = row.get("result_data") or {}
-        us = rd.get("upload_stats") or {}
-        tb = us.get("total_bytes", 0) or 0
+    def walk(prefix, uid=None, tid=None, depth=0):
+        nonlocal grand_total, grand_files
+        if depth > 5:
+            return
+        try:
+            items = bucket.list(prefix, options={'limit': 1000})
+        except Exception:
+            return
+        for it in items:
+            n = it.get('name')
+            if not n:
+                continue
+            full = f"{prefix}/{n}"
+            if it.get('id') is None:
+                # depth tracks current listing level; n is the *subdir* name.
+                # depth=0 → currently listing 'public/' → n is a uid
+                # depth=1 → currently listing 'public/{uid}/' → n is a tid
+                if depth == 0:
+                    walk(full, n, None, depth + 1)
+                elif depth == 1:
+                    walk(full, uid, n, depth + 1)
+                else:
+                    walk(full, uid, tid, depth + 1)
+            else:
+                sz = (it.get('metadata') or {}).get('size', 0) or 0
+                grand_total += sz
+                grand_files += 1
+                if uid:
+                    s = user_storage.setdefault(uid, {'bytes': 0, 'task_ids': set(), 'tasks': {}})
+                    s['bytes'] += sz
+                    if tid:
+                        s['task_ids'].add(tid)
+                        s['tasks'][tid] = s['tasks'].get(tid, 0) + sz
 
-        if uid not in user_stats:
-            user_stats[uid] = {"email": user_map.get(uid, uid[:20]),
-                               "total_bytes": 0, "tasks": 0, "task_list": []}
-        user_stats[uid]["total_bytes"] += tb
-        user_stats[uid]["tasks"] += 1
-        if tb > 0:
-            user_stats[uid]["task_list"].append({
-                "id": row["id"], "status": row["status"],
-                "bytes": tb, "uploaded": us.get("uploaded", 0),
-            })
-        grand_total += tb
+    walk("public", depth=0)
 
-    # 存储用量
+    # Storage usage
     used_gb = grand_total / 1024 / 1024 / 1024
     used_pct = used_gb / 100 * 100
-
     p(f"\n### 文件存储（Pro 计划含 100 GB）\n\n")
     p("所有仿真任务完成/失败后，输出文件会上传到 Supabase Storage 的 `simulation_results` 存储桶。"
       "用户在前端看到的「浏览文件」和「下载 ZIP」都从这里读取。\n\n")
     p(f"{_bar(used_pct)}\n\n")
     p(f"| 项目 | 值 |\n|---|---|\n"
-      f"| 已使用 | {used_gb:.2f} GB |\n"
+      f"| 已使用 | {_fmt(grand_total)} ({grand_files} 文件) |\n"
       f"| 剩余可用 | ~{100 - used_gb:.1f} GB |\n")
 
-    # 每用户用量
-    p(f"\n### 每用户存储用量\n\n")
-    p(f"每个用户的所有仿真任务上传到 Supabase Storage 的文件总大小：\n\n")
-    p(f"| 用户 | 任务数 | 存储用量 |\n|---|---|---|\n")
-    for uid in sorted(user_stats, key=lambda u: user_stats[u]["total_bytes"], reverse=True):
-        s = user_stats[uid]
-        if s["total_bytes"] == 0:
-            continue
-        p(f"| {s['email']} | {s['tasks']} | {_fmt(s['total_bytes'])} |\n")
-    p(f"| **合计** | **{len(resp.data)}** | **{_fmt(grand_total)}** |\n")
+    # Cross-reference DB row statuses where available (for the per-user table)
+    db_rows = []
+    try:
+        db_rows = sb.table('simulations').select('id, user_id, status').execute().data
+    except Exception:
+        pass
+    db_status = {row['id']: row['status'] for row in db_rows}
 
-    # 数据库
+    # Per-user from Storage
+    p(f"\n### 每用户存储用量\n\n")
+    p(f"每个用户上传到 Supabase Storage 的文件总大小（直接从 bucket 统计，非 DB 估算）：\n\n")
+    p(f"| 用户 | 任务数 | 存储用量 |\n|---|---|---|\n")
+    for uid in sorted(user_storage, key=lambda u: -user_storage[u]['bytes']):
+        s = user_storage[uid]
+        if s['bytes'] == 0:
+            continue
+        email = user_map.get(uid, uid[:8])
+        p(f"| {email} | {len(s['task_ids'])} | {_fmt(s['bytes'])} |\n")
+    p(f"| **合计** | **{sum(len(s['task_ids']) for s in user_storage.values())}** "
+      f"| **{_fmt(grand_total)}** |\n")
+
+    # Database
     p(f"\n### 数据库（Pro 计划含 8 GB）\n\n")
     p(f"PostgreSQL 数据库存储任务元数据（prompt、状态、结果摘要等），不含实际仿真文件。\n\n")
     p(f"| 项目 | 值 |\n|---|---|\n"
-      f"| 仿真任务数 | {len(resp.data)} 行 |\n"
+      f"| 仿真任务数 | {len(db_rows)} 行 |\n"
       f"| 注册用户数 | {len(user_map)} |\n")
+    if grand_files > 0 and len(db_rows) == 0:
+        p(f"\n> ⚠️ Storage 有 {grand_files} 个文件但 DB 0 行——是不是 TTL 把行清了？\n")
 
     # 每任务明细
     if detail:
         p(f"\n### 每任务存储明细\n\n")
-        p(f"| 用户 | 任务 ID | 状态 | 文件数 | 存储大小 |\n|---|---|---|---|---|\n")
-        all_tasks = []
-        for s in user_stats.values():
-            for t in s["task_list"]:
-                t["email"] = s["email"]
-                all_tasks.append(t)
-        for t in sorted(all_tasks, key=lambda x: x["bytes"], reverse=True):
-            p(f"| {t['email']} | {t['id']} | {t['status']} | {t['uploaded']} | {_fmt(t['bytes'])} |\n")
+        p(f"| 用户 | 任务 ID | 状态 | 存储大小 |\n|---|---|---|---|\n")
+        flat = []
+        for uid, s in user_storage.items():
+            email = user_map.get(uid, uid[:8])
+            for tid, sz in s['tasks'].items():
+                flat.append((email, tid, sz))
+        for email, tid, sz in sorted(flat, key=lambda x: -x[2]):
+            tid_int = int(tid) if tid.isdigit() else None
+            status = db_status.get(tid_int, "(no DB row)")
+            p(f"| {email} | {tid} | {status} | {_fmt(sz)} |\n")
 
 
 # ============================================================
