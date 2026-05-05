@@ -44,6 +44,12 @@ _QUOTA_EXEMPT_EMAILS = set(
     e.strip().lower() for e in os.environ.get("QUOTA_EXEMPT_EMAILS", "").split(",") if e.strip()
 )
 
+# Tasks that fail with one of these `error_category` values are refunded:
+# they don't count toward the user's daily quota because the failure was on
+# the platform side, not the user's prompt or BYOK credentials. Driven by the
+# 2026-04-09 incident where a stale platform Codex token wedged user jobs.
+PLATFORM_REFUND_CATEGORIES = ['auth_error_platform', 'codex_quota_exceeded']
+
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
 if not FOAM_AGENT_DIR:
@@ -201,19 +207,13 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
                 pass  # if decode fails, not exempt
 
         if not is_exempt:
-            today_start = datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
-            today_resp = (
-                supabase.table('simulations')
-                .select('id', count='exact')
-                .eq('user_id', user_id)
-                .gte('created_at', today_start)
-                .execute()
-            )
-            today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
-            if today_count >= USER_DAILY_TASK_LIMIT:
-                logger.warning(f"User {user_id} hit daily task limit ({today_count}/{USER_DAILY_TASK_LIMIT})")
+            quota = _count_today_billable(user_id)
+            if quota['billable'] >= USER_DAILY_TASK_LIMIT:
+                logger.warning(
+                    f"User {user_id} hit daily task limit "
+                    f"(billable {quota['billable']}/{USER_DAILY_TASK_LIMIT}, "
+                    f"total {quota['total']}, refunded {quota['refunded']})"
+                )
                 raise HTTPException(
                     status_code=429,
                     detail=f"Daily task limit reached ({USER_DAILY_TASK_LIMIT} tasks/day). Please try again tomorrow."
@@ -318,23 +318,17 @@ async def get_daily_usage(request: Request, user_id: str = Depends(verify_jwt)):
             except Exception:
                 pass
 
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).isoformat()
-        today_resp = (
-            supabase.table('simulations')
-            .select('id', count='exact')
-            .eq('user_id', user_id)
-            .gte('created_at', today_start)
-            .execute()
-        )
-        today_count = today_resp.count if today_resp.count is not None else len(today_resp.data)
+        quota = _count_today_billable(user_id)
         effective_limit = 999999 if is_exempt else USER_DAILY_TASK_LIMIT
         return {
-            "used": today_count,
+            "used": quota['billable'],
             "limit": effective_limit,
-            "remaining": max(0, effective_limit - today_count),
+            "remaining": max(0, effective_limit - quota['billable']),
             "exempt": is_exempt,
+            # Transparency fields: show the user when platform-side failures
+            # have been refunded (used = total_today - refunded_platform_failures).
+            "total_today": quota['total'],
+            "refunded_platform_failures": quota['refunded'],
         }
     except Exception as e:
         logger.error(f"Failed to fetch daily usage: {e}")
@@ -856,6 +850,41 @@ def _get_storage_dir_size(prefix: str) -> int:
 # In-memory cache: { user_id: { "result": {...}, "expires": timestamp } }
 _storage_cache = {}
 _STORAGE_CACHE_TTL = 300  # 5 minutes
+
+
+def _count_today_billable(user_id: str) -> dict:
+    """Count today's tasks for a user, excluding platform-side failures.
+
+    Returns {'total': int, 'refunded': int, 'billable': int}.
+    A "refunded" task is one that failed with an error_category in
+    PLATFORM_REFUND_CATEGORIES — the user is not charged for platform-side
+    failures (e.g. stale Codex token). Used by both the create-task quota
+    check and the /user/daily-usage endpoint.
+    """
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    total_resp = (
+        supabase.table('simulations')
+        .select('id', count='exact')
+        .eq('user_id', user_id)
+        .gte('created_at', today_start)
+        .execute()
+    )
+    total = total_resp.count if total_resp.count is not None else len(total_resp.data)
+
+    refund_resp = (
+        supabase.table('simulations')
+        .select('id', count='exact')
+        .eq('user_id', user_id)
+        .gte('created_at', today_start)
+        .in_('result_data->>error_category', PLATFORM_REFUND_CATEGORIES)
+        .execute()
+    )
+    refunded = refund_resp.count if refund_resp.count is not None else len(refund_resp.data)
+
+    return {'total': total, 'refunded': refunded, 'billable': max(0, total - refunded)}
 
 
 def _get_user_storage_bytes(user_id: str) -> int:
