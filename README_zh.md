@@ -248,6 +248,21 @@ curl localhost:8000/api/v1/admin/status
 
 ## 维护日志
 
+### 2026-05-04
+
+- **诊断回国一个月期间数据被静默清空**（Tasks 469–508）：回国后跑首次 weekly review，报告显示 `**该时间段内没有任务。**`，但 id sequence 已经走到 509（历史共 ~508 个任务）。排查：`simulations` 表整张空，但 Supabase Storage 仍保留 8 个用户、45 个任务目录、2262 个文件、665 MB。根因定位到 **worker.py 自己的 TTL purge 循环**——没人看的时候它一直在跑：failed/cancelled 行 7 天软删 + 3 天后硬删；completed 行 14+3。到 ~2026-04-26 历史所有行都被硬删完。Storage 之所以保留，是因为条件式 Storage 清理（`if storage_base_path:`）对老行（`result_data` 早于该字段）相当于 no-op——但**无条件**的 DB 行删除照样跑了，制造了让 purge 隐身一个月的孤儿 Storage 现象。
+- **Worker TTL 放宽**（`worker.py`）：`TTL_FAILED_DAYS` 7 → 30，`TTL_COMPLETED_DAYS` 14 → 90，`PURGE_RETENTION_DAYS` 3 → 7。净保留期 failed/cancelled 37 天、completed 97 天——一个月的离开窗口绰绰有余。
+- **硬删现在先确认 Storage 清理成功才删 DB 行**（`worker.py:_purge_deleted_simulations`）：`result_data.storage_base_path` 缺失时回退到 `public/{user_id}/{job_id}`（`worker.py` 其它所有上传位置都用这个路径）。`_remove_storage_directory()` 后再 `list()` 一次前缀，发现仍有残留就拒绝删 DB 行；mesh 文件清理也是同一道闸。本地 `runs/` 清理保持 best-effort，不阻塞 DB 删除。孤儿 Storage 场景从此消失。
+- **单任务磁盘限额 400 MB → 1024 MB**（`worker.py`、`.env.example`）：Task #325（`cg.liang@nuaa.edu.cn`，21700 单体电池放电热仿真，`laplacianFoam`）跑了 11 轮 Rewrite 已接近收敛，最后栽在 `[Errno 28] No space left on device`——agent 推理没问题，是预算太紧。新默认值在 `.env.example` 里以 `TASK_DISK_LIMIT_MB=1024` 文档化。
+- **Worker 启动时 Codex token 健康检查**（`worker.py:_check_platform_codex_token`）：读取 `$CODEX_HOME/auth.json` 把 access_token 当 JWT 解析，根据 `exp` claim 输出 `ERROR` / `WARN（< 24h 过期）` / `INFO` 三档日志。把 2026-04-09 的失败模式（Tasks 453/454/455 同时撞上 `HTTP 401 token_expired`，1 小时后 Task 468 撞上 `HTTP 500`）从"静默烧用户 quota"提到了"启动一眼可见"。修复后重启验证日志：`Platform Codex token: token valid until 2026-05-15`。函数本身用 6 个伪造 JWT 单测过（healthy / expiring_soon / expired / missing / malformed / 非 JWT）。
+- **平台侧失败退还每日 quota**（`api_server.py`）：新增 `PLATFORM_REFUND_CATEGORIES = ['auth_error_platform', 'codex_quota_exceeded']` 和 `_count_today_billable(user_id)` helper，用 `.in_()` 过滤 JSONB path `result_data->>error_category`。create-task quota check 和 `GET /user/daily-usage` 都改用 helper，从总数里扣掉退还任务。endpoint 多返了 `total_today` 和 `refunded_platform_failures` 字段供前端透明展示。端到端验证：6 个 probe 任务（3 个 ok / 2 个 platform-fail / 1 个 byok-auth-fail）→ billable = 4；`auth_error_byok` 正确仍计入 quota（用户自己的 key 出问题，不退）。
+- **`weekly_review.py` 用户分页 + CI 兼容**：默认 `per_page=50` 只返了 151 个 auth 用户里的前 50 个，导致报告里大半邮箱列空白。改为 `per_page=200` 分页拉。`.env` 加载也改成可选，CI 里用环境变量直接跑。
+- **GitHub Actions 自动 weekly review**（`.github/workflows/weekly_review.yml`）：每周一 09:00 UTC 跑 `weekly_review.py`，报告作为 90 天 artifact 上传，并自动开 labeled GitHub issue。`workflow_dispatch` 手动触发已验证（[run 25353753830](https://github.com/ruohai0925/cfdqanda-server/actions/runs/25353753830)），首个 issue (#1) 自动创建成功。本次事故的直接教训：每周自动检查在跑，就不会出现一个月的盲区。
+- **`check_storage.py` 用户分页 + Storage 真值扫描**：和 `weekly_review.py` 同款分页 bug——之前显示 50 个用户而非 151。更糟：Storage 总用量从 `simulations.result_data.upload_stats.total_bytes` 算，TTL 清空后这字段没了，脚本报 **0 GB** 但实际 **665 MB / 2262 个文件**。改为直接遍历 `simulation_results` bucket 当真值；DB 行还在时交叉显示 status，没有就显示 `(no DB row)`。Storage > 0 但 DB rows = 0 时额外打一行 warning。
+- **运维清理**：清掉本地 805 MB 的孤儿 `runs/{job_id}` 目录（83 个，DB 行早没了——保留 `test-*` 手测目录和 `.gitkeep`）。`docker builder prune -af` 回收 28.96 GB build cache。本地磁盘共回收 ~30 GB。重启了两个 worker replica 让 worker.py 改动生效——启动日志已确认 `Task disk limit set to 1024 MB` 以及 codex token healthcheck 输出。
+- **User Guide 页面嵌入英文平台介绍视频**（`cfdqanda-client/src/UserGuide.jsx`、`App.jsx`）：YouTube 教程（`_Fveasp8QHI`，`t=8` 跳过开头标题画面）通过 `youtube-nocookie` 域名嵌入指南页顶部，lazy-loaded、16:9 自适应 iframe。Footer 链接从 `User Guide` 改为 `User Guide (incl. video)` / `用户指南（含视频）`，让视频从现有入口可发现，不增加新的顶层 UI。
+- **一次性恢复工具**（不放任何 repo，留在 `cfdqanda/` 父目录）：`rebuild_history.py` 遍历 Storage 重建只读任务索引，DB 没了也能离线参考（恢复了 45 个历史任务）。`system_review.py` 分析同样的数据，输出失败模式和按优先级排序的改进建议——本次维护日志的所有改动都来自它的输出。不 commit，一次性诊断工具。
+
 ### 2026-04-09
 
 - **诊断 controlled mode 系统性弱于 auto mode 的根因**（Tasks 433/443/458/459/465/466/478）：用户 fuadhhasan@RPI 在 Task 433 留言 `"Case 433 failed using the interactive mode; yet case 434 succeeded using the e2e mode."` 直接引出了 4 个互相耦合的 bug。同一 buoyantFoam prompt 在两种 mode 下生成的 `0/alphat`、`system/fvSchemes`、`system/fvSolution` 不同——controlled mode 持续漏写 `compressible::` namespace 前缀、`div(phi,K)`、`div(phi,Ekp)`、以及 compressible 形式的 `div(((rho*nuEff)*dev2(T(grad(U)))))`。
