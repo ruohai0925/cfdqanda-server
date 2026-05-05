@@ -1,0 +1,56 @@
+name: Weekly Review
+
+# Runs weekly_review.py on a schedule and surfaces the report as both a
+# downloadable artifact and an auto-created GitHub issue. This catches the
+# class of problems that bit us in 2026-04: a month-long outage went
+# unnoticed because nobody was looking at the data.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   - SUPABASE_URL          (e.g. https://xxxxx.supabase.co)
+#   - SUPABASE_SERVICE_KEY  (service_role JWT — bypasses RLS, treat as admin)
+
+on:
+  schedule:
+    # Every Monday at 09:00 UTC (Mon 17:00 Beijing, Mon 02:00 PT)
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}    # also allow manual runs from the Actions UI
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write    # for create-issue-from-file
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --quiet supabase
+
+      - name: Generate weekly review
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 weekly_review.py -o weekly_review.md
+          echo "REVIEW_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-review-${{ env.REVIEW_DATE }}
+          path: weekly_review.md
+          retention-days: 90
+
+      - name: Open issue with report
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "Weekly Review ${{ env.REVIEW_DATE }}"
+          content-filepath: weekly_review.md
+          labels: |
+            weekly-review
+            automated

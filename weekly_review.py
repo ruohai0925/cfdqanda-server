@@ -21,11 +21,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
-for line in (script_dir / ".env").read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip().strip('"'))
+env_file = script_dir / ".env"
+if env_file.exists():
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"'))
 
 from supabase import create_client
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
@@ -74,14 +76,22 @@ def generate(args):
     since_str = since.strftime("%Y-%m-%d")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Fetch data
+    # Fetch data — paginate list_users (default per_page is 50, we have 150+)
     user_map = {}
-    try:
-        for u in sb.auth.admin.list_users():
+    page = 1
+    while True:
+        try:
+            batch = sb.auth.admin.list_users(page=page, per_page=200)
+        except Exception:
+            break
+        if not batch:
+            break
+        for u in batch:
             if hasattr(u, "id"):
                 user_map[u.id] = u.email
-    except Exception:
-        pass
+        if len(batch) < 200:
+            break
+        page += 1
 
     profiles = {}
     try:

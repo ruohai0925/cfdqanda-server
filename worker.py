@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import sys
@@ -60,8 +61,11 @@ logger.info(f"Cancel check interval set to {CANCEL_CHECK_INTERVAL} seconds")
 PRE_RUN_TIMEOUT = int(os.environ.get("PRE_RUN_TIMEOUT", "300"))
 logger.info(f"Pre-run timeout set to {PRE_RUN_TIMEOUT} seconds")
 
-# Max disk usage per task (bytes). Default: 400 MB. Task is killed if exceeded.
-TASK_DISK_LIMIT_BYTES = int(os.environ.get("TASK_DISK_LIMIT_MB", "400")) * 1024 * 1024
+# Max disk usage per task (bytes). Default: 1024 MB. Task is killed if exceeded.
+# Bumped from 400 MB after task #325 hit ENOSPC after 11 Rewrite loops on a
+# real heatTransfer case — the agent often produces several tens of MB per
+# loop, so 400 was too tight for cases that need deep error correction.
+TASK_DISK_LIMIT_BYTES = int(os.environ.get("TASK_DISK_LIMIT_MB", "1024")) * 1024 * 1024
 logger.info(f"Task disk limit set to {TASK_DISK_LIMIT_BYTES // (1024*1024)} MB")
 
 # How often (seconds) to check disk usage during subprocess run.
@@ -259,6 +263,51 @@ def _diagnose_subprocess_failure(log_path, effective_provider, is_byok=False):
     except Exception:
         return None, None
     return _diagnose_error_text(content, effective_provider, is_byok)
+
+
+def _check_platform_codex_token():
+    """Validate the platform Codex OAuth token at startup.
+
+    Reads ``$CODEX_HOME/auth.json`` (default ``~/.codex/auth.json``), parses
+    ``access_token`` as a JWT, and inspects the ``exp`` claim. Catches the
+    common failure that caused the 2026-04-09 incident (mass auth_error_platform
+    when the platform's ChatGPT Plus codex token silently expired).
+
+    Returns dict {status, detail} where status ∈ {healthy, expiring_soon,
+    expired, missing, malformed}.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    auth_path = os.path.join(codex_home, "auth.json")
+    if not os.path.isfile(auth_path):
+        return {"status": "missing", "detail": f"no auth.json at {auth_path}"}
+    try:
+        with open(auth_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return {"status": "malformed", "detail": f"cannot parse {auth_path}: {e}"}
+    token = (data or {}).get("access_token") or ""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"status": "malformed", "detail": "access_token is not a JWT"}
+    try:
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception as e:
+        return {"status": "malformed", "detail": f"cannot decode JWT payload: {e}"}
+    exp = payload.get("exp")
+    if not exp:
+        return {"status": "malformed", "detail": "JWT missing exp claim"}
+    expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if expires_at < now:
+        return {"status": "expired",
+                "detail": f"token expired at {expires_at.isoformat()} ({now - expires_at} ago)"}
+    delta = expires_at - now
+    if delta.total_seconds() < 86400:
+        return {"status": "expiring_soon",
+                "detail": f"token expires at {expires_at.isoformat()} (in {delta})"}
+    return {"status": "healthy",
+            "detail": f"token valid until {expires_at.isoformat()}"}
 
 
 # --- 2. 辅助函数：文件树构建和上传 ---
@@ -521,9 +570,9 @@ def recover_stale_jobs():
 # Throttle: run at most once per hour
 _last_purge_time = 0.0
 PURGE_INTERVAL = 3600       # seconds between purge runs
-PURGE_RETENTION_DAYS = 3    # keep soft-deleted rows for 3 days before hard-delete
-TTL_FAILED_DAYS = 7         # auto-expire failed/cancelled tasks after 7 days
-TTL_COMPLETED_DAYS = 14     # auto-expire completed tasks after 14 days
+PURGE_RETENTION_DAYS = 7    # keep soft-deleted rows for 7 days before hard-delete
+TTL_FAILED_DAYS = 30        # auto-expire failed/cancelled tasks after 30 days
+TTL_COMPLETED_DAYS = 90     # auto-expire completed tasks after 90 days
 
 
 def run_purge_cycle():
@@ -546,8 +595,8 @@ def run_purge_cycle():
 def _purge_expired_simulations():
     """
     Auto-expire old simulations by setting deleted_at (soft-delete).
-    - failed/cancelled tasks older than TTL_FAILED_DAYS (7 days)
-    - completed tasks older than TTL_COMPLETED_DAYS (14 days)
+    - failed/cancelled tasks older than TTL_FAILED_DAYS
+    - completed tasks older than TTL_COMPLETED_DAYS
     """
     now_utc = datetime.now(timezone.utc)
 
@@ -632,26 +681,51 @@ def _purge_deleted_simulations():
             user_id = row.get('user_id')
             result_data = row.get('result_data') or {}
 
-            # 1. Delete files from Supabase Storage (recursive)
+            # 1. Delete files from Supabase Storage (recursive).
+            # Fall back to canonical path for older rows missing storage_base_path
+            # (the upload code consistently uses f"public/{user_id}/{job_id}").
             storage_base = result_data.get('storage_base_path')
+            if not storage_base and user_id:
+                storage_base = f"public/{user_id}/{job_id}"
+
+            storage_clean = True
             if storage_base:
                 try:
                     _remove_storage_directory(storage_base)
-                    logger.info(f"Purge: removed Storage files for job {job_id}")
+                    # Verify the directory is actually empty before allowing DB delete.
+                    remaining = supabase.storage.from_('simulation_results').list(storage_base)
+                    if remaining:
+                        storage_clean = False
+                        logger.warning(
+                            f"Purge: Storage path {storage_base} still has {len(remaining)} entries; "
+                            f"keeping DB row {job_id} for retry next cycle"
+                        )
+                    else:
+                        logger.info(f"Purge: removed Storage files for job {job_id}")
                 except Exception as e:
-                    logger.warning(f"Purge: failed to remove Storage files for job {job_id}: {e}")
+                    storage_clean = False
+                    logger.warning(
+                        f"Purge: failed to remove Storage files for job {job_id}: {e}; "
+                        f"keeping DB row for retry next cycle"
+                    )
+            elif not user_id:
+                # No user_id and no storage_base_path — refuse to delete (would orphan Storage).
+                storage_clean = False
+                logger.warning(f"Purge: job {job_id} has no user_id and no storage_base_path; keeping DB row")
 
             # 2. Delete uploaded mesh file from Supabase Storage
             mesh_file = row.get('mesh_file') or {}
             mesh_path = mesh_file.get('storage_path')
+            mesh_clean = True
             if mesh_path:
                 try:
                     supabase.storage.from_('simulation_results').remove([mesh_path])
                     logger.info(f"Purge: removed mesh file {mesh_path} for job {job_id}")
                 except Exception as e:
+                    mesh_clean = False
                     logger.warning(f"Purge: failed to remove mesh file for job {job_id}: {e}")
 
-            # 3. Delete local runs/ directory
+            # 3. Delete local runs/ directory (best-effort; not a gate for DB delete)
             local_run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
             if os.path.isdir(local_run_dir):
                 try:
@@ -660,12 +734,14 @@ def _purge_deleted_simulations():
                 except Exception as e:
                     logger.warning(f"Purge: failed to remove local dir {local_run_dir}: {e}")
 
-            # 3. Delete DB row
-            try:
-                supabase.table('simulations').delete().eq('id', job_id).execute()
-                logger.info(f"Purge: hard-deleted simulation {job_id} from DB")
-            except Exception as e:
-                logger.error(f"Purge: failed to delete DB row for job {job_id}: {e}")
+            # 4. Delete DB row only if cloud storage cleanup actually succeeded.
+            # Otherwise leave the soft-deleted row in place; the next purge cycle retries.
+            if storage_clean and mesh_clean:
+                try:
+                    supabase.table('simulations').delete().eq('id', job_id).execute()
+                    logger.info(f"Purge: hard-deleted simulation {job_id} from DB")
+                except Exception as e:
+                    logger.error(f"Purge: failed to delete DB row for job {job_id}: {e}")
 
     except Exception as e:
         logger.error(f"Purge: error during purge cycle: {e}", exc_info=True)
@@ -2442,6 +2518,22 @@ def main_loop():
     """
     # Start health check HTTP server (daemon thread)
     _start_health_server()
+
+    # Validate the platform Codex OAuth token before claiming any jobs.
+    # A stale/missing token caused the 2026-04-09 mass-failure incident.
+    # Best-effort: log loud errors but don't refuse to start — non-codex
+    # BYOK jobs (anthropic, deepseek, qwen, openai-with-key) can still run.
+    codex_health = _check_platform_codex_token()
+    if codex_health["status"] == "healthy":
+        logger.info(f"[{WORKER_ID}] Platform Codex token: {codex_health['detail']}")
+    elif codex_health["status"] == "expiring_soon":
+        logger.warning(f"[{WORKER_ID}] Platform Codex token EXPIRING SOON: {codex_health['detail']}")
+    else:
+        logger.error(
+            f"[{WORKER_ID}] Platform Codex token UNHEALTHY ({codex_health['status']}): "
+            f"{codex_health['detail']}. Non-BYOK codex jobs will fail until refreshed via "
+            f"`codex login` on the host."
+        )
 
     # Recover any stale jobs from previous Worker crashes
     recover_stale_jobs()
