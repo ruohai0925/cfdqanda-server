@@ -144,10 +144,11 @@ app.add_middleware(
 
 # LLM 配置模型 — 通用设计，不与特定 Agent 耦合
 class LLMConfig(BaseModel):
-    model_provider: Optional[str] = None   # e.g. "openai", "openai-codex", "anthropic"
+    model_provider: Optional[str] = None   # e.g. "openai", "openai-codex", "anthropic", "qwen", "deepseek"
     model_version: Optional[str] = None    # e.g. "gpt-5.3-codex", "gpt-4o", "claude-sonnet-4-5-20250929"
-    api_key: Optional[str] = None          # User-provided API key (for openai/anthropic providers)
+    api_key: Optional[str] = None          # User-provided API key (for openai/anthropic/qwen/deepseek providers)
     codex_token: Optional[str] = None      # ChatGPT/Codex OAuth access token (for openai-codex provider)
+    base_url: Optional[str] = None         # Custom OpenAI-compatible endpoint (Qwen, DeepSeek, self-hosted, etc.)
 
 # 使用 Pydantic 定义前端发送过来的请求体(body)应该长什么样
 # 这可以提供自动的数据验证和生成 API 文档
