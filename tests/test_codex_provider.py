@@ -2,7 +2,7 @@
 Codex provider integration tests.
 
 Verifies:
-1. Worker defaults to openai-codex / gpt-5.3-codex when no llm_config is provided.
+1. Worker defaults to openai-codex / gpt-5.5 when no llm_config is provided.
 2. User-provided model_provider/model_version overrides the default.
 3. openai-codex provider does not inject an API key (it uses OAuth).
 4. OPENAI_API_KEY from .env is preserved in child_env for the embedding provider.
@@ -38,29 +38,29 @@ def create_test_token(user_id=TEST_USER_ID, secret=TEST_JWT_SECRET):
 # --- Worker default tests (pure logic, no server needed) ---
 
 class TestWorkerCodexDefaults:
-    """Verify worker default provider/version logic matches openai-codex/gpt-5.3-codex."""
+    """Verify worker default provider/version logic matches openai-codex/gpt-5.5."""
 
     def test_default_provider_is_codex(self):
         """When llm_config has no model_provider, default to openai-codex."""
         llm_config = {}
         effective_provider = llm_config.get('model_provider') or 'openai-codex'
-        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+        effective_version = llm_config.get('model_version') or 'gpt-5.5'
         assert effective_provider == 'openai-codex'
-        assert effective_version == 'gpt-5.3-codex'
+        assert effective_version == 'gpt-5.5'
 
     def test_empty_llm_config_defaults(self):
-        """When llm_config is None, default to openai-codex/gpt-5.3-codex."""
+        """When llm_config is None, default to openai-codex/gpt-5.5."""
         llm_config = None
         effective_provider = (llm_config or {}).get('model_provider') or 'openai-codex'
-        effective_version = (llm_config or {}).get('model_version') or 'gpt-5.3-codex'
+        effective_version = (llm_config or {}).get('model_version') or 'gpt-5.5'
         assert effective_provider == 'openai-codex'
-        assert effective_version == 'gpt-5.3-codex'
+        assert effective_version == 'gpt-5.5'
 
     def test_user_override_openai(self):
         """When user provides model_provider=openai, it overrides the default."""
         llm_config = {'model_provider': 'openai', 'model_version': 'gpt-4o'}
         effective_provider = llm_config.get('model_provider') or 'openai-codex'
-        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+        effective_version = llm_config.get('model_version') or 'gpt-5.5'
         assert effective_provider == 'openai'
         assert effective_version == 'gpt-4o'
 
@@ -68,13 +68,13 @@ class TestWorkerCodexDefaults:
         """When user provides model_provider=anthropic, it overrides the default."""
         llm_config = {'model_provider': 'anthropic', 'model_version': 'claude-sonnet-4-5-20250929'}
         effective_provider = llm_config.get('model_provider') or 'openai-codex'
-        effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
+        effective_version = llm_config.get('model_version') or 'gpt-5.5'
         assert effective_provider == 'anthropic'
         assert effective_version == 'claude-sonnet-4-5-20250929'
 
     def test_codex_no_api_key_injection(self):
         """openai-codex provider should not have api_key in llm_config."""
-        llm_config = {'model_provider': 'openai-codex', 'model_version': 'gpt-5.3-codex'}
+        llm_config = {'model_provider': 'openai-codex', 'model_version': 'gpt-5.5'}
         user_api_key = llm_config.get('api_key')
         assert user_api_key is None
 
@@ -83,7 +83,7 @@ class TestWorkerCodexDefaults:
         child_env = os.environ.copy()
         child_env['OPENAI_API_KEY'] = 'sk-test-key-for-embeddings'
         child_env['FOAM_MODEL_PROVIDER'] = 'openai-codex'
-        child_env['FOAM_MODEL_VERSION'] = 'gpt-5.3-codex'
+        child_env['FOAM_MODEL_VERSION'] = 'gpt-5.5'
         # OPENAI_API_KEY must still be present (used by text-embedding-3-small)
         assert 'OPENAI_API_KEY' in child_env
         assert child_env['OPENAI_API_KEY'] == 'sk-test-key-for-embeddings'
@@ -165,7 +165,7 @@ class TestApiCodexProvider:
                 "prompt": "lid-driven cavity flow test",
                 "llm_config": {
                     "model_provider": "openai-codex",
-                    "model_version": "gpt-5.3-codex",
+                    "model_version": "gpt-5.5",
                 },
             },
             headers={"Authorization": f"Bearer {token}"},

@@ -154,7 +154,7 @@ def analyze(args):
         us = rd.get("upload_stats") or {}
 
         provider = lc.get("model_provider") or "openai-codex"
-        model = lc.get("model_version") or "gpt-5.3-codex"
+        model = lc.get("model_version") or "gpt-5.5"
         is_byok = bool(lc.get("api_key") or lc.get("model_provider"))
 
         error = rd.get("error", "")

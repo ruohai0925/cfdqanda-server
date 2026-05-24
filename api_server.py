@@ -145,7 +145,7 @@ app.add_middleware(
 # LLM 配置模型 — 通用设计，不与特定 Agent 耦合
 class LLMConfig(BaseModel):
     model_provider: Optional[str] = None   # e.g. "openai", "openai-codex", "anthropic", "qwen", "deepseek"
-    model_version: Optional[str] = None    # e.g. "gpt-5.3-codex", "gpt-4o", "claude-sonnet-4-5-20250929"
+    model_version: Optional[str] = None    # e.g. "gpt-5.5", "gpt-5.3-codex", "claude-sonnet-4-6"
     api_key: Optional[str] = None          # User-provided API key (for openai/anthropic/qwen/deepseek providers)
     codex_token: Optional[str] = None      # ChatGPT/Codex OAuth access token (for openai-codex provider)
     base_url: Optional[str] = None         # Custom OpenAI-compatible endpoint (Qwen, DeepSeek, self-hosted, etc.)
