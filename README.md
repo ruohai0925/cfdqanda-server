@@ -215,7 +215,7 @@ With UptimeRobot configured, step 1 is automated — you get an email alert when
 
 ## Maintenance Log
 
-### 2026-05-04
+### 2026-05-23
 
 - **Diagnosed silent data wipe during a one-month absence** (Tasks 469–508): The first weekly review after returning showed `**该时间段内没有任务。**` even though the id sequence had advanced to 509 (~508 tasks ever created). Investigation: `simulations` table empty, but Supabase Storage still held 45 task dirs / 2262 files / 665 MB across 8 users. Root cause traced to **worker.py's own TTL purge**, running continuously while nobody was watching: failed/cancelled rows soft-deleted at 7 days and hard-deleted 3 days later; completed rows at 14+3. By ~2026-04-26 every historical row had been hard-deleted. Storage was preserved only because the conditional Storage cleanup (`if storage_base_path:`) was a no-op for older rows whose `result_data` predated that field — yet the **unconditional** DB row delete still ran, producing the orphan-Storage symptom that hid the purge from view for a month.
 - **Worker TTL relaxed** (`worker.py`): `TTL_FAILED_DAYS` 7 → 30, `TTL_COMPLETED_DAYS` 14 → 90, `PURGE_RETENTION_DAYS` 3 → 7. Net retention is now 37 days for failed/cancelled and 97 days for completed — comfortably survives a month-long gap.

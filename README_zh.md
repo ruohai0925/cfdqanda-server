@@ -248,7 +248,7 @@ curl localhost:8000/api/v1/admin/status
 
 ## 维护日志
 
-### 2026-05-04
+### 2026-05-23
 
 - **诊断回国一个月期间数据被静默清空**（Tasks 469–508）：回国后跑首次 weekly review，报告显示 `**该时间段内没有任务。**`，但 id sequence 已经走到 509（历史共 ~508 个任务）。排查：`simulations` 表整张空，但 Supabase Storage 仍保留 8 个用户、45 个任务目录、2262 个文件、665 MB。根因定位到 **worker.py 自己的 TTL purge 循环**——没人看的时候它一直在跑：failed/cancelled 行 7 天软删 + 3 天后硬删；completed 行 14+3。到 ~2026-04-26 历史所有行都被硬删完。Storage 之所以保留，是因为条件式 Storage 清理（`if storage_base_path:`）对老行（`result_data` 早于该字段）相当于 no-op——但**无条件**的 DB 行删除照样跑了，制造了让 purge 隐身一个月的孤儿 Storage 现象。
 - **Worker TTL 放宽**（`worker.py`）：`TTL_FAILED_DAYS` 7 → 30，`TTL_COMPLETED_DAYS` 14 → 90，`PURGE_RETENTION_DAYS` 3 → 7。净保留期 failed/cancelled 37 天、completed 97 天——一个月的离开窗口绰绰有余。
