@@ -75,6 +75,17 @@ logger.info(f"Disk check interval set to {DISK_CHECK_INTERVAL} seconds")
 # Health check HTTP server port. Set to 0 to disable.
 HEALTH_CHECK_PORT = int(os.environ.get("HEALTH_CHECK_PORT", "8001"))
 
+# Default OpenAI-compatible endpoints for non-OpenAI providers, used when the
+# user picks BYOK with `qwen` or `deepseek` but doesn't supply an explicit
+# `base_url`. Without these, the request goes to api.openai.com and gets
+# rejected with "Incorrect API key" — see 2026-05-21 incident
+# (zhuge7777@139.com, 10 BYOK failures across qwen/deepseek/openai that were
+# all our routing bug, not the user's keys).
+PROVIDER_DEFAULT_BASE_URLS = {
+    'qwen':     'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    'deepseek': 'https://api.deepseek.com',
+}
+
 # --- Controlled pipeline: exclusive worker lock ---
 # When a worker is bound to a controlled-pipeline job, it must not claim
 # other jobs until that job completes/fails/is cancelled.
@@ -1326,8 +1337,12 @@ def _build_llm_env(llm_config):
     effective_provider = llm_config.get('model_provider') or 'openai-codex'
     effective_version = llm_config.get('model_version') or 'gpt-5.3-codex'
 
-    # OpenAI-compatible providers: map to 'openai' for Foam-Agent
+    # OpenAI-compatible providers: map to 'openai' for Foam-Agent, but first
+    # fill in the provider's standard endpoint if the user didn't supply one.
     base_url = llm_config.get('base_url')
+    if not base_url and effective_provider in PROVIDER_DEFAULT_BASE_URLS:
+        base_url = PROVIDER_DEFAULT_BASE_URLS[effective_provider]
+        logger.info(f"MCP env: using default base_url for {effective_provider} → {base_url}")
     if base_url:
         env['OPENAI_API_BASE'] = base_url
     if effective_provider in ('deepseek', 'qwen'):
@@ -2330,7 +2345,13 @@ def find_and_process_job():
 
         # OpenAI-compatible providers (DeepSeek, Qwen): map to 'openai' for Foam-Agent
         # and set OPENAI_API_BASE so LangChain's ChatOpenAI routes to the correct endpoint.
+        # If user picked qwen/deepseek but didn't supply base_url, fall back to the
+        # provider's standard endpoint — otherwise the request goes to api.openai.com
+        # and gets rejected with "Incorrect API key" (2026-05-21 incident).
         base_url = llm_config.get('base_url')
+        if not base_url and effective_provider in PROVIDER_DEFAULT_BASE_URLS:
+            base_url = PROVIDER_DEFAULT_BASE_URLS[effective_provider]
+            logger.info(f"Job {job_id}: using default base_url for {effective_provider} → {base_url}")
         if base_url:
             child_env['OPENAI_API_BASE'] = base_url
             logger.info(f"Job {job_id}: OPENAI_API_BASE={base_url}")
