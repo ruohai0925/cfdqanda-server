@@ -2559,8 +2559,19 @@ def main_loop():
     # Recover any stale jobs from previous Worker crashes
     recover_stale_jobs()
 
-    # Pre-start MCP server so the first controlled-pipeline job doesn't wait
-    _warmup_mcp_server()
+    # MCP server pre-warm (controlled-pipeline cold-start optimization).
+    # Disabled by default since 2026-05-23: controlled mode usage is < 8% of
+    # jobs but the warmed-up MCP server holds ~2-3 GB resident for the entire
+    # worker lifetime — that plus a new auto-mode subprocess (~3 GB) exceeds
+    # the 5 GB cgroup limit and triggers OOM. Set MCP_PREWARM=true to re-enable
+    # if controlled-mode latency becomes a complaint.
+    if os.environ.get("MCP_PREWARM", "false").lower() in ("1", "true", "yes"):
+        _warmup_mcp_server()
+    else:
+        logger.info(
+            f"[{WORKER_ID}] MCP server pre-warm disabled (MCP_PREWARM != true). "
+            f"First controlled-pipeline job will cold-start (~30-60s)."
+        )
 
     logger.info(f"[{WORKER_ID}] Worker started. Looking for jobs...")
     while True:
