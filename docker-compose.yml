@@ -89,6 +89,10 @@ services:
       # Mount checkpoint middleware (optional, enables pre-run mechanism).
       # Set MIDDLEWARE_HOST_PATH in .env to the absolute host path.
       - ${MIDDLEWARE_HOST_PATH:-./cfdqanda-middleware}:/app/middleware
+      # Persist HuggingFace model cache (Qwen embedding model, ~1.2 GB) on the
+      # host so it survives container recreate/rebuild instead of re-downloading
+      # on every run. One shared copy, like bare-metal ~/.cache/huggingface.
+      - ${HF_CACHE_HOST_PATH:-/mnt/bigdata/hf-cache}:/home/openfoam/.cache/huggingface
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
