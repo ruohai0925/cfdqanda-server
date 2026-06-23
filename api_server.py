@@ -122,6 +122,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # 1. 定义一个 "白名单" 列表，包含所有我们允许的来源
 #    生产/本地域名写在这里；额外来源可通过环境变量 EXTRA_CORS_ORIGINS 添加（逗号分隔）
 _origins_base = [
+    "https://foam-agent.com",
+    "https://www.foam-agent.com",
     "https://cfdqanda.com",
     "https://www.cfdqanda.com",
     "http://localhost:5173",
