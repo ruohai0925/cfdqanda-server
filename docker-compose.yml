@@ -18,7 +18,7 @@
 #   docker compose ps                     # Check service status
 #   docker compose down                   # Stop all services
 #
-# Network: cloudflared (running on host) forwards api.cfdqanda.com -> localhost:8000
+# Network: cloudflared (running on host) forwards api.foam-agent.com (and api.cfdqanda.com) -> localhost:8000
 
 services:
   # --- API Server ---
