@@ -2,7 +2,7 @@
 
 > **License:** [PolyForm Strict 1.0.0](https://polyformproject.org/licenses/strict/1.0.0/) — source available for personal and non-commercial use only.
 
-Platform server layer for [CFDQandA](https://foam-agent.com) — a natural-language-driven CFD simulation platform.
+Platform server layer for [Foam-Agent](https://foam-agent.com) — a natural-language-driven CFD simulation platform.
 
 Contains the API server (FastAPI) and background worker that bridge the React frontend with the Foam-Agent simulation engine.
 

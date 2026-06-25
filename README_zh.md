@@ -2,7 +2,7 @@
 
 > **许可证：** [PolyForm Strict 1.0.0](https://polyformproject.org/licenses/strict/1.0.0/) — 源码仅供个人及非商业用途查阅和使用，禁止商业使用。
 
-[CFDQandA](https://foam-agent.com) 的平台服务层 —— 一个基于自然语言的 CFD 仿真自动化平台。
+[Foam-Agent](https://foam-agent.com) 的平台服务层 —— 一个基于自然语言的 CFD 仿真自动化平台。
 
 本仓库包含 **API 服务器**（FastAPI）和 **后台 Worker**，连接 React 前端与 [Foam-Agent](https://github.com/YYgroup/Foam-Agent) 仿真引擎。
 
