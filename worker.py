@@ -15,6 +15,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from supabase import create_client, Client
 from allrun_validator import audit_allrun_scripts
+from case_lint import lint_hints
 from token_extractor import extract_token_usage
 
 # --- 1. 初始化与配置 ---
@@ -1057,6 +1058,7 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
             extra_result={
                 'log_path_on_server': log_path,
                 'error_category': 'disk_exceeded',
+                'lint_hints': lint_hints(run_dir),
             },
         )
         return True
@@ -1070,6 +1072,7 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
             extra_result={
                 'log_path_on_server': log_path,
                 'error_category': 'timeout',
+                'lint_hints': lint_hints(run_dir),
             },
         )
         return True
@@ -2438,6 +2441,8 @@ def find_and_process_job():
                     'log_path_on_server': log_path,
                     'allrun_audit': allrun_audit,
                     'error_category': err_cat,
+                    # 失败后案例体检(case_lint):把死因附近的可行动线索给到用户(warning-only)
+                    'lint_hints': lint_hints(run_dir),
                 },
             )
 
