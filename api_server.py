@@ -39,6 +39,11 @@ WORKER_HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://localhost:8001/h
 # --- User quota configuration ---
 USER_STORAGE_LIMIT_BYTES = int(os.environ.get("USER_STORAGE_LIMIT_MB", "2048")) * 1024 * 1024  # default 2 GB
 USER_DAILY_TASK_LIMIT = int(os.environ.get("USER_DAILY_TASK_LIMIT", "10"))  # default 10 tasks/day
+# Claude (claude-bridge) per-model daily limits — applies ONLY to
+# llm_config.model_provider == 'claude-bridge' jobs; GPT/codex jobs are
+# unaffected (they only fall under the general USER_DAILY_TASK_LIMIT above).
+CLAUDE_OPUS_DAILY_LIMIT = int(os.environ.get("CLAUDE_OPUS_DAILY_LIMIT", "2"))
+CLAUDE_SONNET_DAILY_LIMIT = int(os.environ.get("CLAUDE_SONNET_DAILY_LIMIT", "5"))
 # Admin emails exempt from daily task limit (comma-separated)
 _QUOTA_EXEMPT_EMAILS = set(
     e.strip().lower() for e in os.environ.get("QUOTA_EXEMPT_EMAILS", "").split(",") if e.strip()
@@ -220,6 +225,40 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
                 raise HTTPException(
                     status_code=429,
                     detail=f"Daily task limit reached ({USER_DAILY_TASK_LIMIT} tasks/day). Please try again tomorrow."
+                )
+
+        # 1b. Claude (claude-bridge) per-model daily limit — Claude jobs only,
+        # GPT/codex jobs skip this entirely. Exempt emails reuse is_exempt above.
+        if (not is_exempt and sim_request.llm_config
+                and sim_request.llm_config.model_provider == 'claude-bridge'):
+            req_model = (sim_request.llm_config.model_version or 'opus').lower()
+            bucket = 'opus' if 'opus' in req_model else 'sonnet'  # haiku/other → sonnet bucket
+            limit = CLAUDE_OPUS_DAILY_LIMIT if bucket == 'opus' else CLAUDE_SONNET_DAILY_LIMIT
+            today_start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            # Few rows per user/day — fetch and bucket in Python (keep it simple)
+            rows = (
+                supabase.table('simulations')
+                .select('llm_config')
+                .eq('user_id', user_id)
+                .gte('created_at', today_start)
+                .eq('llm_config->>model_provider', 'claude-bridge')
+                .execute()
+            ).data or []
+            used = 0
+            for r in rows:
+                m = ((r.get('llm_config') or {}).get('model_version') or 'opus').lower()
+                if ('opus' if 'opus' in m else 'sonnet') == bucket:
+                    used += 1
+            if used >= limit:
+                logger.warning(
+                    f"User {user_id} hit Claude {bucket} daily limit ({used}/{limit})"
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Daily Claude {bucket} limit reached ({limit}/day). "
+                           f"Please try again tomorrow or choose another model."
                 )
 
         # 2. Storage quota (reuse cached storage calculation)
