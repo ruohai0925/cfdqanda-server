@@ -1359,7 +1359,7 @@ def _build_llm_env(llm_config):
         # Subscription Claude via the local claude-bridge sidecar (OpenAI-compatible).
         base_url = base_url or CLAUDE_BRIDGE_URL
         if not llm_config.get('model_version'):
-            effective_version = 'sonnet'
+            effective_version = 'opus'
         env['OPENAI_API_KEY'] = CLAUDE_BRIDGE_TOKEN or 'sk-bridge-local'
     if base_url:
         env['OPENAI_API_BASE'] = base_url
@@ -2386,7 +2386,7 @@ def find_and_process_job():
             # Subscription Claude via the local claude-bridge sidecar (OpenAI-compatible).
             base_url = base_url or CLAUDE_BRIDGE_URL
             if not llm_config.get('model_version'):
-                effective_version = 'sonnet'
+                effective_version = 'opus'
             child_env['OPENAI_API_KEY'] = CLAUDE_BRIDGE_TOKEN or 'sk-bridge-local'
             logger.info(f"Job {job_id}: claude-bridge → {base_url} (claude model: {effective_version})")
         if base_url:
