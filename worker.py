@@ -87,6 +87,15 @@ PROVIDER_DEFAULT_BASE_URLS = {
     'deepseek': 'https://api.deepseek.com',
 }
 
+# --- Subscription-Claude bridge (opt-in, machine-specific) ---
+# Jobs with llm_config.model_provider == 'claude-bridge' run against a local
+# claude-bridge sidecar (platform repo claude-bridge/) that fronts subscription
+# Claude Code (`claude -p`, no API key). Only workers with CLAUDE_BRIDGE_URL
+# configured can run them; workers without it re-queue the job so a
+# bridge-equipped worker (currently: the desktop) picks it up.
+CLAUDE_BRIDGE_URL = os.environ.get('CLAUDE_BRIDGE_URL', '').strip()
+CLAUDE_BRIDGE_TOKEN = os.environ.get('CLAUDE_BRIDGE_TOKEN', '').strip()
+
 # --- Controlled pipeline: exclusive worker lock ---
 # When a worker is bound to a controlled-pipeline job, it must not claim
 # other jobs until that job completes/fails/is cancelled.
@@ -1346,9 +1355,15 @@ def _build_llm_env(llm_config):
     if not base_url and effective_provider in PROVIDER_DEFAULT_BASE_URLS:
         base_url = PROVIDER_DEFAULT_BASE_URLS[effective_provider]
         logger.info(f"MCP env: using default base_url for {effective_provider} → {base_url}")
+    if effective_provider == 'claude-bridge':
+        # Subscription Claude via the local claude-bridge sidecar (OpenAI-compatible).
+        base_url = base_url or CLAUDE_BRIDGE_URL
+        if not llm_config.get('model_version'):
+            effective_version = 'sonnet'
+        env['OPENAI_API_KEY'] = CLAUDE_BRIDGE_TOKEN or 'sk-bridge-local'
     if base_url:
         env['OPENAI_API_BASE'] = base_url
-    if effective_provider in ('deepseek', 'qwen'):
+    if effective_provider in ('deepseek', 'qwen', 'claude-bridge'):
         effective_provider = 'openai'
 
     env['FOAMAGENT_MODEL_PROVIDER'] = effective_provider
@@ -1515,7 +1530,7 @@ def _handle_controlled_pipeline(job):
     llm_config = job.get('llm_config') or {}
     is_byok = bool(llm_config.get('api_key') or llm_config.get('codex_token'))
     effective_provider = llm_config.get('model_provider') or 'openai-codex'
-    if effective_provider in ('deepseek', 'qwen'):
+    if effective_provider in ('deepseek', 'qwen', 'claude-bridge'):
         effective_provider = 'openai'
 
     # Augmented prompt: raw user prompt + [PLATFORM NOTE] constraints.
@@ -2219,6 +2234,18 @@ def find_and_process_job():
     _update_stats(current_job_id=job_id)
     logger.info(f"[{WORKER_ID}] Claimed job {job_id} via claim_next_job() RPC. Processing...")
 
+    # --- claude-bridge affinity: only bridge-equipped workers may run these jobs ---
+    if ((job.get('llm_config') or {}).get('model_provider') == 'claude-bridge'
+            and not CLAUDE_BRIDGE_URL):
+        logger.info(
+            f"Job {job_id}: requires claude-bridge but CLAUDE_BRIDGE_URL is not set "
+            f"on {WORKER_ID}. Re-queuing for a bridge-equipped worker."
+        )
+        supabase.table('simulations').update({'status': 'queued'}).eq('id', job_id).execute()
+        _update_stats(current_job_id=None)
+        time.sleep(10)  # damp requeue ping-pong while no bridge-equipped worker is online
+        return False
+
     # --- Controlled pipeline mode: MCP stage-by-stage ---
     pipeline_mode = job.get('pipeline_mode', 'auto')
     if pipeline_mode == 'controlled':
@@ -2355,10 +2382,17 @@ def find_and_process_job():
         if not base_url and effective_provider in PROVIDER_DEFAULT_BASE_URLS:
             base_url = PROVIDER_DEFAULT_BASE_URLS[effective_provider]
             logger.info(f"Job {job_id}: using default base_url for {effective_provider} → {base_url}")
+        if effective_provider == 'claude-bridge':
+            # Subscription Claude via the local claude-bridge sidecar (OpenAI-compatible).
+            base_url = base_url or CLAUDE_BRIDGE_URL
+            if not llm_config.get('model_version'):
+                effective_version = 'sonnet'
+            child_env['OPENAI_API_KEY'] = CLAUDE_BRIDGE_TOKEN or 'sk-bridge-local'
+            logger.info(f"Job {job_id}: claude-bridge → {base_url} (claude model: {effective_version})")
         if base_url:
             child_env['OPENAI_API_BASE'] = base_url
             logger.info(f"Job {job_id}: OPENAI_API_BASE={base_url}")
-        if effective_provider in ('deepseek', 'qwen'):
+        if effective_provider in ('deepseek', 'qwen', 'claude-bridge'):
             logger.info(f"Job {job_id}: mapping provider '{effective_provider}' → 'openai' (OpenAI-compatible)")
             effective_provider = 'openai'
 
