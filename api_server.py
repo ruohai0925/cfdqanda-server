@@ -53,7 +53,14 @@ _QUOTA_EXEMPT_EMAILS = set(
 # they don't count toward the user's daily quota because the failure was on
 # the platform side, not the user's prompt or BYOK credentials. Driven by the
 # 2026-04-09 incident where a stale platform Codex token wedged user jobs.
-PLATFORM_REFUND_CATEGORIES = ['auth_error_platform', 'codex_quota_exceeded']
+PLATFORM_REFUND_CATEGORIES = [
+    'auth_error_platform', 'codex_quota_exceeded',
+    # Added 2026-08-14 after the one-month case review: transient LLM-gateway
+    # 5xx and empty/truncated streamed responses killed 7 jobs that Foam-Agent
+    # refuses to retry. The prompt was fine — don't bill the user's daily quota
+    # for our provider's hiccup. See docs/active/case-review-2026-08-14.md.
+    'llm_upstream_error', 'llm_response_error',
+]
 
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")

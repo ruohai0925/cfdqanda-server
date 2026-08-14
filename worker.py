@@ -267,6 +267,33 @@ def _diagnose_error_text(text, effective_provider, is_byok=False):
             "Meanwhile you can use BYOK with your own API key to keep working."
         ), 'auth_error_platform'
 
+    # Upstream 5xx / connection resets from the LLM gateway. Transient and on
+    # the provider's side; Foam-Agent classes these as "non-throttling" and
+    # kills the whole job without retrying (see docs Foam-Agent-Comments §9).
+    # 2 such failures in the 2026-08-14 review — the user should not be charged.
+    if any(p in lower for p in [
+        'http 500 for', 'http 502 for', 'http 503 for', 'http 504 for',
+        'upstream connect error', 'connection termination',
+        'bad gateway', 'service unavailable', 'internal server error',
+    ]):
+        return (
+            "The LLM provider's gateway returned a temporary error (5xx) and "
+            "Foam-Agent does not retry these, so the run stopped early. "
+            "This is not a problem with your prompt — please just resubmit."
+        ), 'llm_upstream_error'
+
+    # Empty / truncated streamed responses from the LLM. Same class of problem:
+    # transient, platform-side, no retry. 5 such failures in the same review.
+    if any(p in lower for p in [
+        'empty response; expected json', 'response ended prematurely',
+        'incomplete chunked read', 'chunkedencodingerror',
+    ]):
+        return (
+            "The LLM returned an empty or truncated response and Foam-Agent "
+            "stopped instead of retrying. This is a transient platform-side "
+            "issue, not a problem with your prompt — please just resubmit."
+        ), 'llm_response_error'
+
     return None, None
 
 
@@ -946,6 +973,48 @@ def _check_prompt(prompt, job_id):
             ),
         })
 
+    # 4. Under-specified prompt — the single strongest failure predictor.
+    # One-month review (2026-08-14, docs/active/case-review-2026-08-14.md):
+    #   <100 chars -> 0% success (n=5), 100-400 -> 20% (n=10),
+    #   400-1000 -> 91% (n=22), >1000 -> 84% (n=19).
+    # ~72% of all failures traced back to prompts missing the basics. The four
+    # built-in example prompts are all 400+ chars and succeed ~90%, so we nudge
+    # users toward that shape instead of letting the agent flounder to timeout.
+    _spec_elements = [
+        ('geometry/mesh', r'mesh|cells?|grid|blockmesh|网格|几何|尺寸|dimension|m\b|mm|cm|直径|长度|radius|diameter'),
+        ('boundary conditions', r'boundar|inlet|outlet|wall|velocit|pressure|no.slip|边界|入口|出口|壁面|速度|压力'),
+        ('solver/physics', r'foam\b|solver|laminar|turbulen|incompressible|compressible|求解器|层流|湍流|不可压|可压|多相|传热'),
+        ('time settings', r'time.?step|deltat|endtime|starttime|steady|transient|iterat|时间步|时长|稳态|瞬态|秒|\bs\b'),
+    ]
+    missing = [name for name, pat in _spec_elements
+               if not _re.search(pat, prompt, _re.IGNORECASE)]
+    # A question ("how do I…", "what's the best way…") is not a runnable spec.
+    is_question = bool(_re.search(
+        r'(怎么|如何|怎样|best way|how (do|to|can|should)|what.{0,20}\?|请问)', prompt, _re.IGNORECASE
+    ) or prompt.strip().endswith(('?', '？')))
+
+    if len(prompt) < 400 or missing or is_question:
+        parts = []
+        if is_question:
+            parts.append(
+                "The request reads as a QUESTION rather than a simulation spec. "
+                "Do not answer it conversationally — infer a concrete, runnable "
+                "case and state the assumptions you made."
+            )
+        if missing:
+            parts.append(f"The request does not specify: {', '.join(missing)}.")
+        if len(prompt) < 400:
+            parts.append(f"The request is short ({len(prompt)} chars); brief prompts historically fail.")
+        parts.append(
+            "Choose conservative, explicitly-stated defaults for anything missing "
+            "(coarse mesh < 100K cells, simple 2D geometry where plausible, "
+            "laminar unless turbulence is implied, short end time with few write "
+            "intervals), keep the case minimal so it actually runs to completion, "
+            "and record every assumption in the case setup. Prefer a simple case "
+            "that converges over an ambitious one that times out."
+        )
+        warnings.append({'type': 'underspecified_prompt', 'message': ' '.join(parts)})
+
     # Log non-platform warnings
     real_warnings = [w for w in warnings if w['type'] != 'platform_info']
     if real_warnings:
@@ -1074,19 +1143,64 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
 
     if timed_out:
         timeout_min = SIMULATION_TIMEOUT // 60
+        # Tell the user WHERE it got to, not just that the clock ran out.
+        # The 2026-08-14 review found 9 timeouts whose only feedback was
+        # "timed out" — yet the logs show they reached the reviewer stage and
+        # had produced 30-118 files before spinning in the fix loop.
+        progress = _summarize_progress(log_path, run_dir)
+        msg = f'Simulation timed out after {timeout_min} minutes.'
+        if progress['stage']:
+            msg += f" Last stage reached: {progress['stage']}."
+        if progress['files']:
+            msg += f" {progress['files']} files were generated and uploaded — inspect them to see how far the setup got."
+        if progress['fix_attempts']:
+            msg += f" The agent was still in its error-correction loop ({progress['fix_attempts']} attempts), which usually means the case setup never became runnable; try a simpler / more fully specified request."
         _upload_and_fail(
-            job_id, user_id,
-            f'Simulation timed out after {timeout_min} minutes.',
+            job_id, user_id, msg,
             run_dir=run_dir,
             extra_result={
                 'log_path_on_server': log_path,
                 'error_category': 'timeout',
+                'timeout_progress': progress,
                 'lint_hints': lint_hints(run_dir),
             },
         )
         return True
 
     return False
+
+
+# Foam-Agent LangGraph node names, in pipeline order (src/main.py add_node calls).
+_PIPELINE_STAGES = ['planner', 'meshing', 'input_writer', 'local_runner',
+                    'hpc_runner', 'reviewer', 'visualization']
+
+
+def _summarize_progress(log_path, run_dir):
+    """Best-effort 'how far did it get' summary for timeout diagnostics.
+
+    Returns {'stage': str|None, 'files': int, 'fix_attempts': int}. Purely
+    informational — never raises, so it can be called on any failure path.
+    """
+    info = {'stage': None, 'files': 0, 'fix_attempts': 0}
+    try:
+        if log_path and os.path.isfile(log_path):
+            with open(log_path, 'r', errors='replace') as f:
+                content = f.read()
+            last_pos = -1
+            for stage in _PIPELINE_STAGES:
+                pos = content.rfind(stage)
+                if pos > last_pos:
+                    last_pos, info['stage'] = pos, stage
+            info['fix_attempts'] = len(_re.findall(
+                r'fix attempt|Fix attempt|apply_fixes|retrying', content))
+    except Exception:
+        pass
+    try:
+        if run_dir and os.path.isdir(run_dir):
+            info['files'] = sum(len(fs) for _r, _d, fs in os.walk(run_dir))
+    except Exception:
+        pass
+    return info
 
 
 def _run_allrun_audit(run_dir, job_id):
