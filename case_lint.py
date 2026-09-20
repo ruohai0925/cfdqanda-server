@@ -23,6 +23,16 @@ _INCOMPRESSIBLE = {"icoFoam", "pisoFoam", "pimpleFoam", "simpleFoam", "interFoam
 _PURE_FLUID = _INCOMPRESSIBLE | {"buoyantFoam", "rhoPimpleFoam", "rhoSimpleFoam", "sonicFoam"}
 
 
+# 网格/前后处理工具,其 log.* 不代表求解结果(与 worker._OF_UTILITY_LOGS 同义)
+_UTILITY_APPS = {
+    "blockMesh", "snappyHexMesh", "checkMesh", "setFields", "decomposePar",
+    "reconstructPar", "reconstructParMesh", "surfaceFeatures", "surfaceFeatureExtract",
+    "topoSet", "createPatch", "extrudeMesh", "transformPoints", "renumberMesh",
+    "mapFields", "foamToVTK", "postProcess", "foamDictionary", "foamLog",
+    "paraFoam", "moveDynamicMesh", "splitMeshRegions", "refineMesh",
+}
+
+
 def _dict_get(path: Path, key: str):
     if not path.is_file():
         return None
@@ -45,11 +55,33 @@ def _fixed_pressure_values(field_file: Path) -> list[float]:
 
 
 def lint_hints(run_dir) -> list[str]:
-    """对失败任务的 output/ 算例做静态体检 → 用户可读提示列表。异常安全:任何错误返回已有结果。"""
+    """对失败任务的算例做静态体检 → 用户可读提示列表。异常安全:任何错误返回已有结果。
+
+    算例既可能直接躺在 `output/`,也可能是 Foam-Agent 的多算例布局
+    `output/cases/<name>/`(如 #713 的参数扫描,9 个算例)。后者过去完全扫不到:
+    #713 的 lint_hints 返回空列表,而 `output/cases/*/log.SRFSimpleFoam` 里
+    明明写着缺 `0/Urel` 的 FOAM FATAL ERROR。两种布局都要查。
+    """
     hints: list[str] = []
     try:
         base = Path(run_dir)
-        case = base / "output" if (base / "output").is_dir() else base
+        root = base / "output" if (base / "output").is_dir() else base
+        cases = [root]
+        if (root / "cases").is_dir():
+            cases += sorted(d for d in (root / "cases").iterdir() if d.is_dir())
+        for case in cases:
+            for h in _lint_case(case):
+                if h not in hints:            # 多算例布局下同一问题会重复命中
+                    hints.append(h)
+    except Exception as e:                       # lint 绝不拖垮失败处理主流程
+        logger.warning(f"case_lint 异常(忽略): {e}")
+    return hints
+
+
+def _lint_case(case: Path) -> list[str]:
+    """对单个 OpenFOAM 算例目录做体检。"""
+    hints: list[str] = []
+    try:
         app = _dict_get(case / "system" / "controlDict", "application") or ""
 
         # ① 固定压差 + 不可压求解器(#617:80 kPa 压差 → 空气无界加速 → deltaT 坍缩 → 永不完)
@@ -89,6 +121,29 @@ def lint_hints(run_dir) -> list[str]:
                 "求解器,不会读取这些文件——即使跑完也不是真正的 FSI。双向流固耦合需要专用"
                 "耦合求解器(如 solids4Foam),当前平台暂不支持,建议改为刚性边界近似或联系我们。")
 
+        # ⑤ 求解器自己报的 FOAM FATAL ERROR(#713:SRFSimpleFoam 缺 0/Urel)
+        # Foam-Agent 的 "Allrun executed successfully without errors" 不可信,
+        # 求解器日志才是唯一真相;把 OpenFOAM 原话直接摆给用户,比任何猜测都有用。
+        for solver_log in sorted(case.glob("log.*")):
+            if solver_log.name[4:] in _UTILITY_APPS:
+                continue
+            txt = solver_log.read_text(errors="ignore")
+            m = re.search(r"-->\s*FOAM FATAL (?:IO )?ERROR:?\s*(.{0,200})", txt, re.S)
+            if not m:
+                continue
+            # 去掉 "From function ... in file ... at line N." 的调用栈噪音
+            detail = " ".join(m.group(1).split()).split("From function")[0].strip()
+            hint = (f"求解器 {solver_log.name[4:]} 直接报错退出(不是算不完,是压根没跑起来):"
+                    f"{detail}")
+            miss = re.search(r'cannot find file "?[^"]*/0/(\w+)"?', detail)
+            if miss and solver_log.name[4:].startswith("SRF"):
+                hint += (f"。SRF(单旋转坐标系)系列求解器读的是相对速度场 {miss.group(1)},"
+                         "不是 U——请在 0/ 下提供该场,或改用非 SRF 求解器 + MRF 方式。")
+            elif miss:
+                hint += f"。0/ 目录缺少该求解器必需的场文件 {miss.group(1)},请补齐后重试。"
+            hints.append(hint)
+            break
+
         # ④ setFields 前置文件缺失(#616:0/ 只有 alpha.water.orig,Allrun 又没有拷贝步)
         allrun = case / "Allrun"
         if allrun.is_file() and "setFields" in allrun.read_text(errors="ignore"):
@@ -103,6 +158,6 @@ def lint_hints(run_dir) -> list[str]:
                             "——setFields 运行时会因缺少该场文件而失败,请在 setFields 前补 "
                             f"`cp 0/{f.name} 0/{plain.name}`。")
                         break
-    except Exception as e:                       # lint 绝不拖垮失败处理主流程
-        logger.warning(f"case_lint 异常(忽略): {e}")
+    except Exception as e:                       # 单个算例出错不影响其余算例
+        logger.warning(f"case_lint 单算例异常(忽略) {case}: {e}")
     return hints

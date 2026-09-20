@@ -1209,8 +1209,12 @@ def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout,
 
 
 def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
-                                  cancelled, timed_out, disk_exceeded=False):
-    """Update DB for cancelled, timed-out, or disk-exceeded jobs. Returns True if handled."""
+                                  cancelled, timed_out, disk_exceeded=False,
+                                  output_path=None):
+    """Update DB for cancelled, timed-out, or disk-exceeded jobs. Returns True if handled.
+
+    A timeout is not always a failure: see the salvage branch below.
+    """
     if cancelled:
         logger.info(f"Job {job_id} was cancelled by user. Subprocess terminated.")
         _upload_and_fail(job_id, user_id, 'Simulation cancelled by user.',
@@ -1238,11 +1242,45 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
 
     if timed_out:
         timeout_min = SIMULATION_TIMEOUT // 60
+        solver = _detect_solver_outcome(run_dir)
         # Tell the user WHERE it got to, not just that the clock ran out.
         # The 2026-08-14 review found 9 timeouts whose only feedback was
         # "timed out" — yet the logs show they reached the reviewer stage and
         # had produced 30-118 files before spinning in the fix loop.
         progress = _summarize_progress(log_path, run_dir)
+
+        # --- salvage: post-processing is not the simulation ---
+        # The visualization node retries its LLM call up to max_loop=25 times
+        # (Foam-Agent src/config.py; no env override — see Foam-Agent-Comments
+        # §11), which can eat a whole 40-minute budget *after* the solver has
+        # already converged. Throwing that away marks a finished simulation as
+        # failed. If the solver log ends with OpenFOAM's "End" and the only
+        # stage still running was visualization, deliver the results and say
+        # what is missing. Anything short of a clean solver log still fails —
+        # Foam-Agent's own "Allrun executed successfully" is not evidence.
+        if solver['status'] == 'completed' and progress['stage'] == 'visualization':
+            logger.info(
+                f"Job {job_id}: timed out in visualization, but {solver['solver']} "
+                f"finished cleanly — completing with a warning instead of failing."
+            )
+            _upload_and_complete(
+                job_id, user_id, run_dir,
+                output_path or os.path.join(run_dir, "output"),
+                log_path, _run_allrun_audit(run_dir, job_id),
+                extra_result={
+                    'warning': (
+                        f"The {solver['solver']} solver finished successfully, but the "
+                        f"{timeout_min}-minute limit was reached while generating plots, so "
+                        f"visualization output may be missing or incomplete. The simulation "
+                        f"results themselves are complete."
+                    ),
+                    'warning_category': 'visualization_timeout',
+                    'solver_outcome': solver,
+                    'timeout_progress': progress,
+                },
+            )
+            return True
+
         msg = f'Simulation timed out after {timeout_min} minutes.'
         if progress['stage']:
             msg += f" Last stage reached: {progress['stage']}."
@@ -1250,6 +1288,18 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
             msg += f" {progress['files']} files were generated and uploaded — inspect them to see how far the setup got."
         if progress['fix_attempts']:
             msg += f" The agent was still in its error-correction loop ({progress['fix_attempts']} attempts), which usually means the case setup never became runnable; try a simpler / more fully specified request."
+        # The solver log is the only trustworthy record of what happened: job
+        # #713 timed out while Foam-Agent reported "Allrun executed successfully
+        # without errors", yet SRFSimpleFoam had aborted on a missing field.
+        # Surfacing the actual OpenFOAM error beats "the clock ran out".
+        if solver['status'] == 'fatal':
+            msg += (f" Note: the {solver['solver']} solver itself aborted with an OpenFOAM error"
+                    f" before the clock ran out — \"{solver['fatal']}\" — so the time limit is a"
+                    f" symptom, not the cause. Fix that error first.")
+        elif solver['status'] == 'incomplete' and solver['solver']:
+            msg += (f" The {solver['solver']} solver was still running when the limit hit"
+                    f" (it had not reached its end time), so the case is simply too heavy for"
+                    f" the time budget — coarsen the mesh, shorten endTime, or raise the timeout.")
         _upload_and_fail(
             job_id, user_id, msg,
             run_dir=run_dir,
@@ -1257,6 +1307,7 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
                 'log_path_on_server': log_path,
                 'error_category': 'timeout',
                 'timeout_progress': progress,
+                'solver_outcome': solver,
                 'lint_hints': lint_hints(run_dir),
             },
         )
@@ -1264,6 +1315,70 @@ def _handle_cancelled_or_timeout(job_id, user_id, run_dir, log_path,
 
     return False
 
+
+
+# OpenFOAM writes one `log.<application>` per step. These are meshing/pre/post
+# utilities — everything else is treated as a solver, whose log is the only
+# trustworthy record of whether the simulation actually ran.
+_OF_UTILITY_LOGS = {
+    'blockMesh', 'snappyHexMesh', 'checkMesh', 'setFields', 'decomposePar',
+    'reconstructPar', 'reconstructParMesh', 'surfaceFeatures', 'surfaceFeatureExtract',
+    'topoSet', 'createPatch', 'extrudeMesh', 'transformPoints', 'renumberMesh',
+    'mapFields', 'foamToVTK', 'postProcess', 'foamDictionary', 'foamLog',
+    'paraFoam', 'moveDynamicMesh', 'splitMeshRegions', 'refineMesh',
+}
+
+
+def _detect_solver_outcome(run_dir):
+    """Read the OpenFOAM solver logs and report what actually happened.
+
+    Foam-Agent's own "Allrun executed successfully without errors" is not
+    evidence: in job #713 it printed exactly that while SRFSimpleFoam had died
+    with `FOAM FATAL ERROR: cannot find file .../0/Urel` (the SRF solvers read
+    Urel, not U). A clean OpenFOAM run ends by printing "End"; a fatal one
+    aborts before it. So trust the solver log, nothing else.
+
+    Returns {'status', 'solver', 'fatal', 'logs_checked'} with status in:
+      completed  — at least one solver log ended with "End", none fatal
+      fatal      — a solver log carries FOAM FATAL (message in 'fatal')
+      incomplete — solver ran but never reached "End" (killed / still running)
+      unknown    — no solver log found
+    """
+    info = {'status': 'unknown', 'solver': None, 'fatal': None, 'logs_checked': 0}
+    try:
+        logs = []
+        for root, _dirs, files in os.walk(run_dir or ''):
+            for fn_ in files:
+                if fn_.startswith('log.') and fn_[4:] not in _OF_UTILITY_LOGS:
+                    logs.append(os.path.join(root, fn_))
+        info['logs_checked'] = len(logs)
+        completed = None
+        for path in sorted(logs):
+            try:
+                size = os.path.getsize(path)
+                with open(path, 'r', errors='replace') as f:
+                    if size > 65536:
+                        f.seek(size - 65536)
+                    tail = f.read()
+            except Exception:
+                continue
+            app = os.path.basename(path)[4:]
+            m = _re.search(r'-->\s*FOAM FATAL (?:IO )?ERROR:?\s*(.{0,400})', tail, _re.S)
+            if m or 'FOAM FATAL' in tail:
+                # drop OpenFOAM's "From function ... at line N." stack noise
+                detail = ' '.join((m.group(1) if m else '').split())
+                detail = detail.split('From function')[0].strip()[:300]
+                info.update(status='fatal', solver=app, fatal=detail or 'FOAM FATAL ERROR')
+                return info          # a fatal anywhere is decisive
+            if tail.rstrip().endswith('End'):
+                completed = app
+        if completed:
+            info.update(status='completed', solver=completed)
+        elif logs:
+            info.update(status='incomplete', solver=os.path.basename(sorted(logs)[-1])[4:])
+    except Exception as e:
+        logger.warning(f"_detect_solver_outcome failed (ignored): {e}")
+    return info
 
 # Foam-Agent LangGraph node names, in pipeline order (src/main.py add_node calls).
 _PIPELINE_STAGES = ['planner', 'meshing', 'input_writer', 'local_runner',
@@ -1431,13 +1546,15 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
 
 
 def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun_audit,
-                         upload_dir=None):
+                         upload_dir=None, extra_result=None):
     """Upload results to Supabase Storage and update DB status to completed.
 
     Args:
         upload_dir: Directory to use for file tree + individual file uploads.
                     Defaults to run_dir.  Controlled pipeline passes case_dir
                     here because the generated OpenFOAM files live outside run_dir.
+        extra_result: Additional dict entries merged into result_data — used to
+                    carry a warning when the run completed with a caveat.
     """
     # Sanitize simulation.log before uploading to prevent credential leaks
     _sanitize_log_file(os.path.join(run_dir, "simulation.log"))
@@ -1491,6 +1608,8 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
     }
     if token_usage:
         final_result["token_usage"] = token_usage
+    if extra_result:
+        final_result.update(extra_result)
 
     # Preserve accumulated stage feedback before clearing pipeline_state
     try:
@@ -2679,7 +2798,8 @@ def find_and_process_job():
         )
 
         if _handle_cancelled_or_timeout(job_id, job['user_id'], run_dir, log_path,
-                                        cancelled, timed_out, disk_exceeded):
+                                        cancelled, timed_out, disk_exceeded,
+                                        output_path=output_path):
             return True
 
         # Post-execution Allrun security audit
