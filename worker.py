@@ -10,6 +10,8 @@ import json
 import shutil
 import threading
 import fnmatch
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -226,10 +228,20 @@ def _diagnose_error_text(text, effective_provider, is_byok=False):
     lower = text.lower()
 
     # Rate limit / quota exceeded (OpenAI, Codex, Anthropic, DeepSeek)
+    # NOTE: the Codex subscription backend does NOT use any of the OpenAI
+    # Platform wordings. It returns
+    #   HTTP 429 for https://chatgpt.com/backend-api/codex/responses.
+    #   Body: {"error":{"type":"usage_limit_reached",
+    #          "message":"The usage limit has been reached","plan_type":"plus",...}}
+    # which matched none of the original patterns, so jobs #710-#712
+    # (2026-09-05) were logged with error_category=None and billed to the user.
+    # Patterns below are copied from that real payload.
     if any(p in lower for p in [
         'rate_limit_exceeded', 'ratelimiterror', 'rate limit reached',
         'too many requests', 'quota exceeded', 'insufficient_quota',
         'you exceeded your current quota',
+        'usage_limit_reached', 'usage limit has been reached',
+        'http 429', 'error code: 429', 'status 429',
     ]):
         if effective_provider == 'openai-codex' and not is_byok:
             return (
@@ -247,6 +259,11 @@ def _diagnose_error_text(text, effective_provider, is_byok=False):
         'authenticationerror', 'invalid api key', 'invalid_api_key',
         'incorrect api key', 'unauthorized', 'http 401', 'status 401',
         'error code: 401', '401 unauthorized', 'token_expired',
+        # claude-bridge fronts subscription Claude Code; when its OAuth session
+        # dies the bridge reports it as an HTTP 500 whose body carries this
+        # text, so it must be matched here (before the 5xx branch below) or it
+        # is mistaken for a transient gateway error. Jobs #704/#705/#707.
+        'oauth session expired', 'failed to authenticate',
     ]):
         if is_byok:
             # User-provided credential is the problem
@@ -260,6 +277,16 @@ def _diagnose_error_text(text, effective_provider, is_byok=False):
                 "Your API key is invalid or expired. "
                 "Please verify the key in your provider's dashboard and resubmit."
             ), 'auth_error_byok'
+        # claude-bridge is platform-side only (never BYOK): a dead `claude -p`
+        # OAuth session needs an operator to re-login, so say so explicitly
+        # instead of telling the user to "try again later".
+        if 'claude -p' in lower or 'oauth session expired' in lower:
+            return (
+                "The platform's subscription-Claude bridge is not authenticated "
+                "(its login session expired). The administrator has been notified. "
+                "Please re-run with the default model, or use BYOK with your own API key."
+            ), 'bridge_auth_error'
+
         # Platform default credential is the problem
         return (
             "Platform default model is temporarily unavailable (authentication failed). "
@@ -273,6 +300,7 @@ def _diagnose_error_text(text, effective_provider, is_byok=False):
     # 2 such failures in the 2026-08-14 review — the user should not be charged.
     if any(p in lower for p in [
         'http 500 for', 'http 502 for', 'http 503 for', 'http 504 for',
+        'error code: 500', 'error code: 502', 'error code: 503', 'error code: 504',
         'upstream connect error', 'connection termination',
         'bad gateway', 'service unavailable', 'internal server error',
     ]):
@@ -356,6 +384,73 @@ def _check_platform_codex_token():
                 "detail": f"token expires at {expires_at.isoformat()} (in {delta})"}
     return {"status": "healthy",
             "detail": f"token valid until {expires_at.isoformat()}"}
+
+
+
+# --- claude-bridge preflight ---
+# The bridge's GET handler answers 200 unconditionally without ever invoking
+# `claude -p`, so a dead OAuth session still looks healthy there. On 2026-08-31
+# that cost three user submissions (#704/#705/#707): every job marched to the
+# planner node and died on
+#   500 - claude -p rc=1: 'Failed to authenticate: OAuth session expired ...'
+# Only a real completion exercises the login, so that is what we probe with.
+_BRIDGE_HEALTH_TTL = 300  # seconds; a dead session needs a human, so don't spam
+_bridge_health_cache = {"checked_at": 0.0, "result": None}
+
+
+def _check_claude_bridge(force=False):
+    """Probe the claude-bridge sidecar with a minimal real completion.
+
+    Returns dict {status, detail} where status is one of:
+      healthy      — bridge answered a completion
+      auth_expired — bridge is up but its Claude login is dead (needs operator)
+      unreachable  — no bridge listening (sidecar down / wrong URL)
+      error        — bridge answered with some other failure
+      disabled     — CLAUDE_BRIDGE_URL not configured on this worker
+
+    Cached for _BRIDGE_HEALTH_TTL seconds unless force=True.
+    """
+    if not CLAUDE_BRIDGE_URL:
+        return {"status": "disabled", "detail": "CLAUDE_BRIDGE_URL not set"}
+
+    now = time.time()
+    cached = _bridge_health_cache["result"]
+    if not force and cached and (now - _bridge_health_cache["checked_at"]) < _BRIDGE_HEALTH_TTL:
+        return cached
+
+    url = CLAUDE_BRIDGE_URL.rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": "haiku",  # cheapest model the bridge will pass through
+        "messages": [{"role": "user", "content": "reply with the single word OK"}],
+        "max_tokens": 16,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CLAUDE_BRIDGE_TOKEN or 'sk-bridge-local'}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        content = (payload.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        result = {"status": "healthy", "detail": f"bridge answered: {content[:40]!r}"}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        lower = detail.lower()
+        if "oauth session expired" in lower or "failed to authenticate" in lower:
+            result = {"status": "auth_expired", "detail": detail}
+        else:
+            result = {"status": "error", "detail": f"HTTP {e.code}: {detail}"}
+    except urllib.error.URLError as e:
+        result = {"status": "unreachable", "detail": f"{url}: {e.reason}"}
+    except Exception as e:
+        result = {"status": "error", "detail": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    _bridge_health_cache["checked_at"] = now
+    _bridge_health_cache["result"] = result
+    return result
 
 
 # --- 2. 辅助函数：文件树构建和上传 ---
@@ -2349,8 +2444,8 @@ def find_and_process_job():
     logger.info(f"[{WORKER_ID}] Claimed job {job_id} via claim_next_job() RPC. Processing...")
 
     # --- claude-bridge affinity: only bridge-equipped workers may run these jobs ---
-    if ((job.get('llm_config') or {}).get('model_provider') == 'claude-bridge'
-            and not CLAUDE_BRIDGE_URL):
+    wants_bridge = (job.get('llm_config') or {}).get('model_provider') == 'claude-bridge'
+    if wants_bridge and not CLAUDE_BRIDGE_URL:
         logger.info(
             f"Job {job_id}: requires claude-bridge but CLAUDE_BRIDGE_URL is not set "
             f"on {WORKER_ID}. Re-queuing for a bridge-equipped worker."
@@ -2359,6 +2454,38 @@ def find_and_process_job():
         _update_stats(current_job_id=None)
         time.sleep(10)  # damp requeue ping-pong while no bridge-equipped worker is online
         return False
+
+    # --- claude-bridge preflight: don't send a job into a dead login ---
+    # Without this the job runs all the way to the planner node and fails there
+    # (#704/#705/#707, 2026-08-31). An expired login needs an operator to
+    # re-authenticate, so fail fast with an actionable message; a bridge that is
+    # merely down or flaky is transient, so re-queue instead.
+    if wants_bridge:
+        bridge_health = _check_claude_bridge()
+        if bridge_health["status"] == "auth_expired":
+            logger.error(
+                f"[{WORKER_ID}] claude-bridge login expired — failing job {job_id} early. "
+                f"Re-authenticate with `claude` on the bridge host. Detail: {bridge_health['detail']}"
+            )
+            msg, cat = _diagnose_error_text(
+                bridge_health["detail"], 'claude-bridge', is_byok=False
+            )
+            _upload_and_fail(
+                job_id, job.get('user_id'),
+                msg or "The platform's subscription-Claude bridge is not authenticated.",
+                extra_result={'error_category': cat or 'bridge_auth_error'},
+            )
+            _update_stats(current_job_id=None)
+            return True
+        if bridge_health["status"] in ("unreachable", "error"):
+            logger.warning(
+                f"[{WORKER_ID}] claude-bridge {bridge_health['status']} "
+                f"({bridge_health['detail']}) — re-queuing job {job_id}."
+            )
+            supabase.table('simulations').update({'status': 'queued'}).eq('id', job_id).execute()
+            _update_stats(current_job_id=None)
+            time.sleep(10)
+            return False
 
     # --- Controlled pipeline mode: MCP stage-by-stage ---
     pipeline_mode = job.get('pipeline_mode', 'auto')
@@ -2708,6 +2835,18 @@ def main_loop():
             f"{codex_health['detail']}. Non-BYOK codex jobs will fail until refreshed via "
             f"`codex login` on the host."
         )
+
+    # Same idea for the claude-bridge sidecar, when this worker has one.
+    if CLAUDE_BRIDGE_URL:
+        bridge_health = _check_claude_bridge(force=True)
+        if bridge_health["status"] == "healthy":
+            logger.info(f"[{WORKER_ID}] claude-bridge: {bridge_health['detail']}")
+        else:
+            logger.error(
+                f"[{WORKER_ID}] claude-bridge UNHEALTHY ({bridge_health['status']}): "
+                f"{bridge_health['detail']}. claude-bridge jobs will be re-queued or "
+                f"failed until `claude` is re-authenticated on the bridge host."
+            )
 
     # Recover any stale jobs from previous Worker crashes
     recover_stale_jobs()

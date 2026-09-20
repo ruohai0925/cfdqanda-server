@@ -60,6 +60,10 @@ PLATFORM_REFUND_CATEGORIES = [
     # refuses to retry. The prompt was fine — don't bill the user's daily quota
     # for our provider's hiccup. See docs/active/case-review-2026-08-14.md.
     'llm_upstream_error', 'llm_response_error',
+    # Added 2026-09-19 after the second case review: the claude-bridge OAuth
+    # session expired and killed 3 jobs (#704/#705/#707) whose prompts were
+    # fine — one of them succeeded verbatim on the default model minutes later.
+    'bridge_auth_error',
 ]
 
 # --- Foam-Agent 目录配置 ---

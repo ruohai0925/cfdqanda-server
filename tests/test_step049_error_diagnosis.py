@@ -241,6 +241,78 @@ class TestDiagnoseSubprocessFailure:
 
 
 # ---------------------------------------------------------------------------
+# Part 1b: real production payloads (2026-09-19 case review)
+#
+# Every assertion below is a verbatim excerpt from a simulation.log pulled out
+# of Supabase Storage. The synthetic phrasings in Part 1 all passed while these
+# six jobs were still being classified as error_category=None and billed to the
+# user — so when a class of failure gets missed, pin the real bytes here.
+# ---------------------------------------------------------------------------
+
+class TestRealWorldPayloads:
+    """Regression tests built from actual failed-job logs."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, worker_module):
+        self.diagnose_text = worker_module[0]._diagnose_error_text
+
+    # --- Codex subscription quota (jobs #710/#711/#712, 2026-09-05) ---
+
+    CODEX_429 = (
+        'requests.exceptions.HTTPError: HTTP 429 for '
+        'https://chatgpt.com/backend-api/codex/responses. Body: '
+        '{"error":{"type":"usage_limit_reached","message":"The usage limit has '
+        'been reached","plan_type":"plus","resets_at":1788598496,'
+        '"eligible_promo":null,"resets_in_seconds":7509}}\n'
+        "During task with name 'planner'"
+    )
+
+    def test_codex_usage_limit_reached_is_quota(self):
+        """Real Codex 429 body uses 'usage_limit_reached', not 'rate limit'."""
+        msg, cat = self.diagnose_text(self.CODEX_429, 'openai-codex', is_byok=False)
+        assert cat == 'codex_quota_exceeded', f"got {cat}"
+        assert 'quota' in msg.lower()
+
+    def test_codex_usage_limit_byok_is_rate_limit(self):
+        """Same payload from a BYOK Codex token is the user's own quota."""
+        msg, cat = self.diagnose_text(self.CODEX_429, 'openai-codex', is_byok=True)
+        assert cat == 'rate_limit', f"got {cat}"
+
+    # --- claude-bridge OAuth expiry (jobs #704/#705/#707, 2026-08-31) ---
+
+    BRIDGE_AUTH = (
+        "openai.InternalServerError: Error code: 500 - {'error': {'message': "
+        '"claude -p rc=1: stderr=\'\' stdout=\'Failed to authenticate: OAuth '
+        "session expired and could not be refreshed'\", 'type': 'server_error'}}\n"
+        "During task with name 'planner'"
+    )
+
+    def test_bridge_oauth_expiry_is_auth_not_5xx(self):
+        """Bridge wraps a dead login in a 500 — must not read as a transient 5xx."""
+        msg, cat = self.diagnose_text(self.BRIDGE_AUTH, 'claude-bridge', is_byok=False)
+        assert cat == 'bridge_auth_error', f"got {cat}"
+        assert 'not authenticated' in msg.lower()
+
+    def test_bridge_auth_error_is_refundable(self):
+        """The category must be in the API's refund list, or users get billed."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_api_src", os.path.join(os.path.dirname(__file__), "..", "api_server.py"))
+        src = open(spec.origin).read()
+        assert "'bridge_auth_error'," in src.split("PLATFORM_REFUND_CATEGORIES = [")[1].split("]")[0]
+
+    # --- a genuine bridge 5xx still reads as transient ---
+
+    def test_plain_500_still_upstream_error(self):
+        """openai-python spells gateway failures 'Error code: 500'."""
+        msg, cat = self.diagnose_text(
+            "openai.InternalServerError: Error code: 500 - "
+            "{'error': {'message': 'upstream timeout', 'type': 'server_error'}}",
+            'openai', is_byok=False)
+        assert cat == 'llm_upstream_error', f"got {cat}"
+
+
+# ---------------------------------------------------------------------------
 # Part 2: Timeout error_category test
 # ---------------------------------------------------------------------------
 
