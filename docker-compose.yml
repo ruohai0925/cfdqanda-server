@@ -79,6 +79,12 @@ services:
       - ./mcp_client.py:/app/worker/mcp_client.py:ro
       - ./allrun_validator.py:/app/worker/allrun_validator.py:ro
       - ./token_extractor.py:/app/worker/token_extractor.py:ro
+      # case_lint.py and taxonomy.py were baked into the image only, so edits to
+      # them silently did NOT take effect on `git pull` + restart (found
+      # 2026-09-22: a case_lint fix had been "deployed" for a day while the
+      # container still ran the old copy). Mount them like the rest.
+      - ./case_lint.py:/app/worker/case_lint.py:ro
+      - ./taxonomy.py:/app/worker/taxonomy.py:ro
       # Bind mount Foam-Agent repo from host into the container.
       # This overrides the baked-in copy, allowing git pull without rebuilding.
       # Set FOAM_AGENT_HOST_PATH in .env to the absolute host path.

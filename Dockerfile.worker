@@ -39,6 +39,7 @@ COPY allrun_validator.py .
 COPY token_extractor.py .
 COPY mcp_client.py .
 COPY case_lint.py .
+COPY taxonomy.py .
 
 # --- Worker entrypoint ---
 # The base image's entrypoint (foamagent-entrypoint.sh) sources OpenFOAM and

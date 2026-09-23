@@ -18,6 +18,7 @@ from pathlib import Path
 from supabase import create_client, Client
 from allrun_validator import audit_allrun_scripts
 from case_lint import lint_hints
+import taxonomy
 from token_extractor import extract_token_usage
 
 # --- 1. 初始化与配置 ---
@@ -798,6 +799,62 @@ def _remove_storage_directory(prefix):
         bucket.remove(files)
 
 
+_archive_warned = False
+
+
+def _archive_simulation(row):
+    """Write the permanent usage record for a task that is about to be deleted.
+
+    The TTL purge is the last moment a task exists. Until 2026-09-22 nothing ran
+    here, so ~90% of all tasks ever submitted (766 created, 76 left) vanished
+    with no trace of when they ran, by whom, or in what CFD area — and Supabase
+    backups could not help, since they only reach back 7 days.
+
+    Keeps derived shape only (length, language, domain tags): prompts and
+    results still expire on schedule, statistics do not. Returns True on
+    success; the caller keeps the row for a later retry when this fails, so a
+    missing table means data waits rather than disappearing.
+    """
+    global _archive_warned
+    rd = row.get('result_data') or {}
+    lc = row.get('llm_config') or {}
+    stats = rd.get('upload_stats') or {}
+    shape = taxonomy.summarize(row.get('prompt'))
+    record = {
+        'id': row['id'],
+        'user_id': row.get('user_id'),
+        'created_at': row.get('created_at'),
+        'finished_at': row.get('updated_at'),
+        'status': row.get('status'),
+        'error_category': rd.get('error_category'),
+        'model_provider': lc.get('model_provider'),
+        'model_version': lc.get('model_version'),
+        'pipeline_mode': row.get('pipeline_mode'),
+        'timeout_minutes': row.get('timeout_minutes'),
+        'prompt_len': shape['prompt_len'],
+        'prompt_lang': shape['prompt_lang'],
+        'domain_tags': shape['domain_tags'],
+        'is_platform_test': shape['is_platform_test'],
+        'files_uploaded': stats.get('uploaded'),
+        'bytes_uploaded': stats.get('total_bytes'),
+        'user_rating': row.get('user_rating'),
+        'archive_source': 'purge',
+    }
+    try:
+        supabase.table('simulation_archive').upsert(record, on_conflict='id').execute()
+        return True
+    except Exception as e:
+        if not _archive_warned:
+            logger.error(
+                f"Purge: cannot write simulation_archive ({e}). Apply "
+                f"sql/simulation_archive.sql in the Supabase SQL editor. Rows stay "
+                f"soft-deleted (Storage is still freed) and will be archived on a "
+                f"later cycle — nothing is lost, but the table will grow until then."
+            )
+            _archive_warned = True
+        return False
+
+
 def _purge_deleted_simulations():
     """
     Hard-delete simulations where deleted_at is older than PURGE_RETENTION_DAYS.
@@ -807,7 +864,8 @@ def _purge_deleted_simulations():
     try:
         response = (
             supabase.table('simulations')
-            .select('id, user_id, result_data, mesh_file')
+            .select('id, user_id, result_data, mesh_file, prompt, status, created_at, '
+                    'updated_at, llm_config, pipeline_mode, timeout_minutes, user_rating')
             .not_.is_('deleted_at', 'null')
             .lt('deleted_at', cutoff)
             .execute()
@@ -877,9 +935,13 @@ def _purge_deleted_simulations():
                 except Exception as e:
                     logger.warning(f"Purge: failed to remove local dir {local_run_dir}: {e}")
 
-            # 4. Delete DB row only if cloud storage cleanup actually succeeded.
-            # Otherwise leave the soft-deleted row in place; the next purge cycle retries.
-            if storage_clean and mesh_clean:
+            # 4. Archive the usage record before the row is gone for good.
+            archived = _archive_simulation(row)
+
+            # 5. Delete DB row only if cloud storage cleanup actually succeeded
+            # AND the usage record is safely archived. Otherwise leave the
+            # soft-deleted row in place; the next purge cycle retries.
+            if storage_clean and mesh_clean and archived:
                 try:
                     supabase.table('simulations').delete().eq('id', job_id).execute()
                     logger.info(f"Purge: hard-deleted simulation {job_id} from DB")
