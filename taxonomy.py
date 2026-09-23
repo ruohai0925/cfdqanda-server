@@ -52,9 +52,13 @@ DOMAIN_LABELS = {
 
 _COMPILED = [(tag, re.compile(pat, re.I)) for tag, pat in DOMAIN_PATTERNS]
 _CJK = re.compile(r'[一-鿿]')
-# Platform's own test submissions: docker_submit_test_tasks.sh writes "[Test i/n]",
-# validation batches use "[V1-cavity r2]" / "[V4-regression]".
-_TEST_PROMPT = re.compile(r'^\s*\[(test|v\d|regression)', re.I)
+# Platform's own test submissions, in all three shapes seen in production:
+#   docker_submit_test_tasks.sh   -> "[Test 1/5] ..."
+#   validation batches            -> "[V1-cavity r2] ...", "[V4-regression] ..."
+#   tests/test_step007_concurrency.py -> "__test_step007_<hex> concurrency test job 0"
+# The last one was missed until 2026-09-22, when the archive backfill surfaced
+# 22 of them sitting in the historical data as if they were user traffic.
+_TEST_PROMPT = re.compile(r'^\s*(\[(test|v\d|regression)|__test_)', re.I)
 
 
 def domain_tags(prompt):
