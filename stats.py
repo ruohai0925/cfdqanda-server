@@ -187,6 +187,36 @@ def main():
         "activation_rate_pct": round(len(active) / max(len(users), 1) * 100, 1),
     }
 
+    # ---------- web traffic ----------
+    # Only exists from the day sql/page_events.sql was applied — there is no
+    # way to reconstruct visits or dwell time for anything before that.
+    if sb.table_exists("page_events"):
+        ev = sb.select("page_events", "select=session_id,path,user_id,started_at,last_seen_at,referrer")
+        per_session = collections.defaultdict(lambda: {"secs": 0.0, "paths": set(), "user": None})
+        for e in ev:
+            f = "%Y-%m-%dT%H:%M:%S"
+            try:
+                secs = (datetime.datetime.strptime(e["last_seen_at"][:19], f)
+                        - datetime.datetime.strptime(e["started_at"][:19], f)).total_seconds()
+            except Exception:
+                secs = 0.0
+            row = per_session[e["session_id"]]
+            row["secs"] += max(secs, 0.0)
+            row["paths"].add(e["path"])
+            row["user"] = row["user"] or e.get("user_id")
+        dwell = sorted(r["secs"] for r in per_session.values())
+        out["web"] = {
+            "visits": len(per_session),
+            "page_views": len(ev),
+            "signed_in_visits": sum(1 for r in per_session.values() if r["user"]),
+            "median_dwell_sec": round(dwell[len(dwell) // 2]) if dwell else 0,
+            "over_1min_pct": round(sum(1 for d in dwell if d >= 60) / len(dwell) * 100) if dwell else 0,
+            "by_path": dict(collections.Counter(e["path"] for e in ev)),
+            "referrers": collections.Counter(e["referrer"] for e in ev if e.get("referrer")).most_common(6),
+        }
+    else:
+        out["web"] = None
+
     # ---------- print ----------
     u = out["users"]; a = out["affiliations"]; v = out["volume"]; d = out["domains"]
     print("=" * 72)
@@ -211,6 +241,20 @@ def main():
           f" 平台自测 {d['platform_test_tasks']} 个已剔除）  语言 {d['lang']}")
     for label, n, pct in d["tags"]:
         print(f"   {n:3d} ({pct:3d}%)  {label}")
+
+    w = out["web"]
+    print("=" * 72)
+    if w is None:
+        print("访问统计: 未启用 — 在 Supabase SQL Editor 应用 sql/page_events.sql 后开始累积")
+    elif w["visits"] == 0:
+        print("访问统计: 已启用,尚无数据(埋点刚上线)")
+    else:
+        print(f"访问统计: {w['visits']} 次访问 / {w['page_views']} 次页面浏览"
+              f" | 登录状态访问 {w['signed_in_visits']}")
+        print(f"  停留时长中位数 {w['median_dwell_sec']}s,停留超过 1 分钟的访问占 {w['over_1min_pct']}%")
+        print("  页面:", w["by_path"])
+        if w["referrers"]:
+            print("  来源:", ", ".join(f"{k}×{v}" for k, v in w["referrers"]))
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
