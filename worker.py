@@ -1589,7 +1589,8 @@ def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None
     except Exception as e:
         logger.warning(f"Job {job_id}: failed to read pipeline_state for stage_feedback: {e}")
 
-    update_data = {'status': 'failed', 'result_data': result_data}
+    update_data = {'status': 'failed', 'result_data': result_data,
+                   'updated_at': datetime.now(timezone.utc).isoformat()}
     if extra_fields:
         update_data.update(extra_fields)
 
@@ -1687,6 +1688,10 @@ def _upload_and_complete(job_id, user_id, run_dir, output_path, log_path, allrun
         'result_data': final_result,
         'pipeline_stage': None,
         'pipeline_state': None,
+        # Stamp the finish time explicitly: nothing else maintains updated_at,
+        # so before 2026-09-22 it equalled created_at on most rows and a run's
+        # turnaround could not be measured at all.
+        'updated_at': datetime.now(timezone.utc).isoformat(),
     }).eq('id', job_id).execute()
 
     logger.info(f"Job {job_id} completed and all files uploaded successfully. "
