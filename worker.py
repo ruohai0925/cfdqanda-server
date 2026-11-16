@@ -1029,6 +1029,13 @@ _PLATFORM_NOTE = (
     "OpenFOAM v10 — use v10 API and syntax (not v11/v12/v13). "
     "Single-core serial only — no decomposePar / runParallel. "
     "Mesh: warn if > 2M cells. "
+    # Upstream Foam-Agent treats any "Failed N mesh checks" as fatal, and
+    # -allGeometry flags every snappyHexMesh/hexRef8 refinement boundary as
+    # "concave (using face planes)" — a known false positive that ends the
+    # workflow at mesh review (replayed user case, 2026-11-15; fix proposed
+    # upstream). Plain checkMesh still catches real defects.
+    "Check meshes with plain 'checkMesh' — not 'checkMesh -allGeometry', whose "
+    "concave-cell test misfires on refined meshes. "
     "snappyHexMesh OK with searchable primitives (Box/Cylinder/Sphere/etc.), "
     "but NO STL generation — if needed, ask user to upload a Gmsh .msh. "
     f"Max output: {{}}" "MB; use purgeWrite. "
