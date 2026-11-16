@@ -149,3 +149,25 @@ class TestUpstreamContract:
         block = src.split("PLATFORM_REFUND_CATEGORIES = [")[1].split("]")[0]
         for cat in ("preparation_failed", "platform_resources", "llm_response_error"):
             assert f"'{cat}'" in block, cat
+
+
+class TestQuotaResetTime:
+
+    WEEKLY_429 = ('Error occurred in LLM service: HTTP 429 for https://chatgpt.com/backend-api/codex/responses. '
+                  'Body: {"error":{"type":"usage_limit_reached","message":"The usage limit has been reached",'
+                  '"plan_type":"plus","resets_at":%d,"eligible_promo":null,"resets_in_seconds":221760}}')
+
+    def test_message_states_the_real_reset_time(self, worker, run_dir):
+        """2026-11-16: a weekly limit, 61.6 h away, reported as 'every few hours'."""
+        import time
+        at = int(time.time()) + 61 * 3600
+        log = make_run(run_dir, [self.WEEKLY_429 % at, STOP.format("preparation_failed")], None)
+        status, cat, msg, extra = worker._decide_outcome(2, log, run_dir, "openai-codex", False)
+        assert cat == "codex_quota_exceeded"
+        assert "quota_resets_at" in extra
+        assert "about 61 h" in msg and "every few hours" not in msg
+
+    def test_past_reset_time_is_not_shown(self, worker, run_dir):
+        log = make_run(run_dir, [self.WEEKLY_429 % 1000000000], None)
+        _, cat, msg, extra = worker._decide_outcome(2, log, run_dir, "openai-codex", False)
+        assert cat == "codex_quota_exceeded" and "quota_resets_at" not in extra

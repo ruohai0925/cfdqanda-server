@@ -1542,6 +1542,21 @@ def _read_workflow_outcome(log_path):
 
 
 
+def _quota_reset_at(log_path):
+    """When the LLM provider says the exhausted quota comes back, if it said.
+
+    The Codex backend's 429 carries "resets_at" (epoch seconds). It is usually
+    hours away, but the plan also has a weekly limit: on 2026-11-16 it was
+    61.6 hours, while the message told users the quota "resets every few
+    hours" and invited them to keep retrying.
+    """
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            hits = _re.findall(r'"resets_at"\s*:\s*(\d{9,11})', f.read())
+    except Exception:
+        return None
+    return datetime.fromtimestamp(int(hits[-1]), tz=timezone.utc) if hits else None
+
 def _decide_outcome(returncode, log_path, run_dir, provider, is_byok):
     """Turn a finished Foam-Agent run into (status, error_category, message, extra).
 
@@ -1571,6 +1586,17 @@ def _decide_outcome(returncode, log_path, run_dir, provider, is_byok):
     extra['termination_reason'] = outcome["termination_reason"]
     user_msg, err_cat = _diagnose_subprocess_failure(log_path, provider, is_byok)
     if user_msg:
+        reset = _quota_reset_at(log_path) if err_cat in ('codex_quota_exceeded', 'rate_limit') else None
+        if reset and reset > datetime.now(timezone.utc):
+            hours = (reset - datetime.now(timezone.utc)).total_seconds() / 3600
+            extra['quota_resets_at'] = reset.isoformat()
+            if err_cat == 'codex_quota_exceeded':
+                user_msg = (f"The platform's shared model quota is used up until "
+                            f"{reset:%Y-%m-%d %H:%M} UTC (about {hours:.0f} h from now). "
+                            f"This run did not count toward your daily quota. Until then, "
+                            f"please use BYOK with your own API key.")
+            else:
+                user_msg += f" The provider says the limit resets at {reset:%Y-%m-%d %H:%M} UTC."
         return 'failed', err_cat, user_msg, extra
     if outcome["termination_reason"] in TERMINATION_REASONS:
         cat, msg = TERMINATION_REASONS[outcome["termination_reason"]]
