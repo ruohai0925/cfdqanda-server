@@ -69,6 +69,8 @@ PLATFORM_REFUND_CATEGORIES = [
     # not get its own environment ready, before the request was ever tried.
     # (A failed repair or review loop is about the request, and stays billable.)
     'preparation_failed', 'platform_resources',
+    # Fetching the user's own upload from Storage failed — our side, not theirs.
+    'mesh_download_failed', 'case_archive_download_failed',
 ]
 
 # --- Foam-Agent 目录配置 ---
@@ -177,6 +179,7 @@ class LLMConfig(BaseModel):
 # 这可以提供自动的数据验证和生成 API 文档
 # Note: user_id is no longer in the body — it comes from JWT (verify_jwt dependency)
 MESH_FILE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+CASE_ARCHIVE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB compressed; the worker also caps the unpacked size
 
 class MeshFileInfo(BaseModel):
     storage_path: str
@@ -190,6 +193,7 @@ class SimulationRequest(BaseModel):
     pipeline_mode: str = 'auto'  # 'auto' (subprocess one-shot) or 'controlled' (MCP stage-by-stage)
     checkpoints: Optional[List[str]] = None  # Active checkpoints: ['files_review', 'pre_run_review', 'plan_review']
     mesh_file: Optional[MeshFileInfo] = None  # Optional custom mesh (.msh) uploaded to Supabase Storage
+    case_archive: Optional[MeshFileInfo] = None  # Optional existing OpenFOAM case (.zip) for Foam-Agent to import and run
     timeout_minutes: Optional[int] = None  # Custom timeout in minutes (default: 60)
 
 class FeedbackRequest(BaseModel):
@@ -287,8 +291,13 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
                        f"Please delete old tasks to free space."
             )
 
+        # Uploaded files are referenced by a client-supplied Storage path, so it
+        # must point into the requester's own upload area. Without this a request
+        # could name another user's upload and have the worker fetch it.
         # Validate mesh file if provided
         if sim_request.mesh_file:
+            if not sim_request.mesh_file.storage_path.startswith(f"mesh_uploads/{user_id}/"):
+                raise HTTPException(status_code=400, detail="Invalid mesh file reference")
             if not sim_request.mesh_file.original_name.lower().endswith('.msh'):
                 raise HTTPException(status_code=400, detail="Only .msh mesh files are supported")
             if sim_request.mesh_file.size_bytes > MESH_FILE_MAX_BYTES:
@@ -296,6 +305,22 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
                     status_code=400,
                     detail=f"Mesh file exceeds {MESH_FILE_MAX_BYTES // (1024*1024)} MB limit"
                 )
+
+        # Validate an uploaded existing case, if provided
+        if sim_request.case_archive:
+            archive = sim_request.case_archive
+            if not archive.storage_path.startswith(f"case_uploads/{user_id}/"):
+                raise HTTPException(status_code=400, detail="Invalid case archive reference")
+            if not archive.original_name.lower().endswith('.zip'):
+                raise HTTPException(status_code=400, detail="Upload an existing case as a .zip archive")
+            if archive.size_bytes > CASE_ARCHIVE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Case archive exceeds {CASE_ARCHIVE_MAX_BYTES // (1024*1024)} MB limit"
+                )
+            if sim_request.pipeline_mode != 'auto':
+                raise HTTPException(status_code=400,
+                                    detail="Importing an existing case is available in auto mode only")
 
         # 构建插入数据
         insert_data = {
@@ -319,6 +344,9 @@ async def create_simulation_task(request: Request, sim_request: SimulationReques
         # Custom mesh file reference
         if sim_request.mesh_file:
             insert_data['mesh_file'] = sim_request.mesh_file.model_dump()
+        # Existing case to import (kept in the free-form parameters column)
+        if sim_request.case_archive:
+            insert_data['parameters'] = {'case_archive': sim_request.case_archive.model_dump()}
         # Custom timeout
         if sim_request.timeout_minutes is not None:
             if sim_request.timeout_minutes not in (20, 40, 60, 120):

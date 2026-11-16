@@ -864,7 +864,7 @@ def _purge_deleted_simulations():
     try:
         response = (
             supabase.table('simulations')
-            .select('id, user_id, result_data, mesh_file, prompt, status, created_at, '
+            .select('id, user_id, result_data, mesh_file, parameters, prompt, status, created_at, '
                     'updated_at, llm_config, pipeline_mode, timeout_minutes, user_rating')
             .not_.is_('deleted_at', 'null')
             .lt('deleted_at', cutoff)
@@ -925,6 +925,17 @@ def _purge_deleted_simulations():
                 except Exception as e:
                     mesh_clean = False
                     logger.warning(f"Purge: failed to remove mesh file for job {job_id}: {e}")
+
+            # 2b. Same for an uploaded existing case (.zip) — the user's own
+            # upload, so it goes with the task like the mesh does.
+            case_path = ((row.get('parameters') or {}).get('case_archive') or {}).get('storage_path')
+            if case_path:
+                try:
+                    supabase.storage.from_('simulation_results').remove([case_path])
+                    logger.info(f"Purge: removed case archive {case_path} for job {job_id}")
+                except Exception as e:
+                    mesh_clean = False
+                    logger.warning(f"Purge: failed to remove case archive for job {job_id}: {e}")
 
             # 3. Delete local runs/ directory (best-effort; not a gate for DB delete)
             local_run_dir = os.path.join(FOAM_AGENT_DIR, "runs", str(job_id))
@@ -1473,6 +1484,14 @@ TERMINATION_REASONS = {
     "invalid_review_response": ("llm_response_error",
         "The model returned an unusable review and Foam-Agent stopped. This is a "
         "transient model problem, not your request — please just resubmit."),
+    "case_import_failed": ("case_import_failed",
+        "The uploaded case could not be imported. Make sure the ZIP contains one "
+        "OpenFOAM case (system/controlDict, constant/, and the 0/ initial conditions); "
+        "the workflow report shows exactly what was rejected."),
+    "case_target_mismatch": ("case_target_mismatch",
+        "The uploaded case is written for a different OpenFOAM version. This platform "
+        "runs OpenFOAM Foundation v10; cases from ESI/OpenCFD (v2xxx) or other "
+        "Foundation releases usually need dictionary changes first."),
     "agent_resources_unavailable": ("platform_resources",
         "A platform resource Foam-Agent needs was unavailable. This is on our side — "
         "please try again shortly."),
@@ -1622,7 +1641,10 @@ def _download_mesh_file(job_id, mesh_file_info, run_dir):
     Returns local path on success, None on failure.
     """
     storage_path = mesh_file_info.get('storage_path')
-    original_name = mesh_file_info.get('original_name', 'mesh.msh')
+    # original_name comes from the API request body. Joined as-is, a name like
+    # "../../src/x.msh" wrote outside the run directory — as root, into the
+    # bind-mounted Foam-Agent checkout. Keep only the final path component.
+    original_name = os.path.basename(mesh_file_info.get('original_name') or '') or 'mesh.msh'
     if not storage_path:
         return None
     local_mesh_path = os.path.join(run_dir, original_name)
@@ -1639,6 +1661,52 @@ def _download_mesh_file(job_id, mesh_file_info, run_dir):
         logger.error(f"Job {job_id}: failed to download mesh file: {e}")
         return None
 
+
+
+def _download_case_archive(job_id, info, run_dir):
+    """Fetch an uploaded OpenFOAM case (.zip) into the run directory.
+
+    Saved under a fixed name, never the client-supplied one. Returns the local
+    path, or None on failure.
+    """
+    storage_path = (info or {}).get('storage_path')
+    if not storage_path:
+        return None
+    local = os.path.join(run_dir, "imported_case.zip")
+    try:
+        data = supabase.storage.from_('simulation_results').download(storage_path)
+        with open(local, 'wb') as f:
+            f.write(data)
+        logger.info(f"Job {job_id}: downloaded case archive ({len(data)} bytes)")
+        return local
+    except Exception as e:
+        logger.error(f"Job {job_id}: failed to download case archive: {e}")
+        return None
+
+
+def _case_archive_problem(path):
+    """Reject archives this platform cannot hold, before Foam-Agent unpacks them.
+
+    Foam-Agent guards against path escapes, links and zip bombs itself, but its
+    size ceiling is 10 GiB; ours is the per-task disk limit, which the disk
+    monitor only enforces every DISK_CHECK_INTERVAL seconds — too late for an
+    extraction. Returns a user-facing reason, or None if the archive is fine.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            entries = z.infolist()
+            total = sum(e.file_size for e in entries)
+    except zipfile.BadZipFile:
+        return "The uploaded file is not a valid ZIP archive."
+    if not entries:
+        return "The uploaded ZIP archive is empty."
+    if total > TASK_DISK_LIMIT_BYTES:
+        return (f"The uploaded case unpacks to {total / 2**20:.0f} MB, over this platform's "
+                f"{TASK_DISK_LIMIT_BYTES // 2**20} MB per-task limit. Remove result time "
+                f"directories and processor*/ folders before zipping — the case only needs "
+                f"system/, constant/ and the initial conditions.")
+    return None
 
 def _upload_and_fail(job_id, user_id, error_msg, run_dir=None, extra_result=None,
                      extra_fields=None):
@@ -2108,6 +2176,7 @@ def _handle_controlled_pipeline(job):
             'worker_id': WORKER_ID,
             'has_custom_mesh': bool(mesh_file_info),
             'mesh_original_name': (mesh_file_info or {}).get('original_name'),
+        'imported_case': (case_archive_info or {}).get('original_name'),
         }
         try:
             with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
@@ -2871,6 +2940,18 @@ def find_and_process_job():
 
     prompt_text = job['prompt']
     prompt_warnings = _check_prompt(prompt_text, job_id)
+    case_archive_info = (job.get('parameters') or {}).get('case_archive')
+    if case_archive_info:
+        # An uploaded case carries its own specification; a short request
+        # ("just run it", or nothing at all) is the normal way to use it.
+        prompt_warnings = [w for w in prompt_warnings if w['type'] != 'underspecified_prompt']
+        if not prompt_text.strip():
+            # Foam-Agent substitutes this wording itself for an empty request,
+            # but the platform notes appended below would make the request
+            # non-empty and leave those notes as the only "requirement".
+            prompt_text = ("Run the supplied OpenFOAM case while preserving its existing "
+                           "physical definition. Diagnose and repair technical problems "
+                           "only when execution requires it.")
 
     # Append platform context to prompt so Foam-Agent is aware of constraints
     if prompt_warnings:
@@ -2895,6 +2976,22 @@ def find_and_process_job():
                              'Failed to download uploaded mesh file.',
                              run_dir=run_dir,
                              extra_result={'error_category': 'mesh_download_failed'})
+            return True
+
+    # Download and vet an uploaded existing case, if any
+    case_archive_path = None
+    if case_archive_info:
+        case_archive_path = _download_case_archive(job_id, case_archive_info, run_dir)
+        if not case_archive_path:
+            _upload_and_fail(job_id, job['user_id'],
+                             'Failed to download the uploaded case archive.',
+                             run_dir=run_dir,
+                             extra_result={'error_category': 'case_archive_download_failed'})
+            return True
+        problem = _case_archive_problem(case_archive_path)
+        if problem:
+            _upload_and_fail(job_id, job['user_id'], problem, run_dir=run_dir,
+                             extra_result={'error_category': 'case_archive_rejected'})
             return True
 
     # Write task_settings.json — records all non-secret settings for post-hoc analysis.
@@ -2975,6 +3072,10 @@ def find_and_process_job():
         ]
         if custom_mesh_path:
             command += ["--custom_mesh_path", os.path.abspath(custom_mesh_path)]
+        if case_archive_path:
+            # Foam-Agent imports the archive: a read-only original, a work tree
+            # it runs and repairs, and its report under output/.
+            command += ["--case_path", os.path.abspath(case_archive_path)]
 
         logger.info(f"Executing command for job {job_id}: {' '.join(command)}")
         logger.info(f"Log file for this run will be at: {log_path}")
