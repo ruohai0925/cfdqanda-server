@@ -2187,7 +2187,6 @@ def _handle_controlled_pipeline(job):
             'worker_id': WORKER_ID,
             'has_custom_mesh': bool(mesh_file_info),
             'mesh_original_name': (mesh_file_info or {}).get('original_name'),
-        'imported_case': (case_archive_info or {}).get('original_name'),
         }
         try:
             with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
@@ -3023,6 +3022,7 @@ def find_and_process_job():
         'prompt_warnings': prompt_warnings if prompt_warnings else None,
         'has_custom_mesh': bool(custom_mesh_path),
         'mesh_original_name': (mesh_file_info or {}).get('original_name'),
+        'imported_case': (case_archive_info or {}).get('original_name'),
     }
     try:
         with open(os.path.join(run_dir, "task_settings.json"), "w") as f:
