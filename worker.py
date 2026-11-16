@@ -33,7 +33,17 @@ load_dotenv()  # 自动读取同目录下的 .env 文件
 # ------------------
 
 # --- Worker identification (for multi-worker setups) ---
-WORKER_ID = os.environ.get("WORKER_ID", f"worker-{os.getpid()}")
+# Identity used for controlled-mode affinity (pipeline_state.assigned_worker_id).
+# The worker is PID 1 inside its container, so the old default f"worker-{pid}"
+# made every worker on every machine "worker-1", and the affinity check could
+# never tell GCP from the desktop: a job paused at a checkpoint on one machine
+# could be resumed on the other, where its case files do not exist. Case files
+# live on the machine's disk and are shared by that machine's replicas, so the
+# identity must be per machine and stable across container recreation — set
+# WORKER_SITE (e.g. gcp / desktop) in each machine's .env. Unset keeps the old
+# behaviour.
+WORKER_ID = (os.environ.get("WORKER_ID") or os.environ.get("WORKER_SITE")
+             or f"worker-{os.getpid()}")
 
 # --- Foam-Agent 目录配置 ---
 FOAM_AGENT_DIR = os.environ.get("FOAM_AGENT_DIR")
