@@ -21,14 +21,32 @@ FROM leoyue123/foamagent:latest
 # --- Install Worker-specific dependencies into the FoamAgent conda env ---
 # The base image's conda env does not include supabase or python-dotenv.
 # Use the conda env's pip directly (entrypoint is not active during build).
+# git-lfs: Foam-Agent's FAISS corpus is stored in LFS.
+# libglu1-mesa / libx*: shared libraries the gmsh Python wheel links against,
+# even when used headless.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git-lfs \
+       libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1 libgomp1 \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
+# Pinned to the set the production image has run on since mid-2026. These were
+# unpinned behind a global `--upgrade` (pip applies it to every package on the
+# line, not just faiss-cpu), so any rebuild silently pulled the newest
+# releases: on 2026-11-15 that meant transformers 5.23 against the base image's
+# torch 2.5.1, which dies on import (`NameError: name 'nn' is not defined`)
+# and took every job down at the first embedding lookup. Change these only
+# together with torch, and re-run Foam-Agent's scripts/doctor.py after.
 RUN /opt/conda/envs/FoamAgent/bin/pip install --no-cache-dir \
-    supabase python-dotenv langchain-huggingface sentence-transformers \
-    --upgrade faiss-cpu
+    supabase==2.31.0 python-dotenv \
+    transformers==4.51.3 tokenizers==0.21.1 safetensors==0.5.3 \
+    sentence-transformers==5.5.1 langchain-huggingface==1.2.2 faiss-cpu==1.14.3
+
+# Foam-Agent's gmsh meshing node drives the gmsh Python API. Upstream ships it
+# as an optional extra (pyproject `mesh`), so the base image lacks it and every
+# "generate the mesh yourself with Gmsh" request failed on this platform.
+# Pinned to upstream constraints.txt.
+RUN /opt/conda/envs/FoamAgent/bin/pip install --no-cache-dir gmsh==4.13.1
 
 # --- Copy Worker scripts into the image ---
 # These are our cfdqanda-server files that orchestrate Foam-Agent execution.
