@@ -125,7 +125,7 @@ def _lint_case(case: Path) -> list[str]:
         # Foam-Agent 的 "Allrun executed successfully without errors" 不可信,
         # 求解器日志才是唯一真相;把 OpenFOAM 原话直接摆给用户,比任何猜测都有用。
         for solver_log in sorted(case.glob("log.*")):
-            if solver_log.name[4:] in _UTILITY_APPS:
+            if solver_log.name[4:].split(".")[0] in _UTILITY_APPS:   # log.checkMesh.fine etc.
                 continue
             txt = solver_log.read_text(errors="ignore")
             m = re.search(r"-->\s*FOAM FATAL (?:IO )?ERROR:?\s*(.{0,200})", txt, re.S)

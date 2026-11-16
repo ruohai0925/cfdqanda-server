@@ -197,3 +197,21 @@ class TestLintScansMultiCaseLayout:
         from case_lint import lint_hints
         _write(run_dir, "output/log.icoFoam", COMPLETED_LOG)
         assert lint_hints(run_dir) == []
+
+
+class TestSuffixedLogNames:
+    """Mesh studies name logs log.<app>.<variant> (seen in a 2026-11 replay:
+    log.blockMesh.fine, log.checkMesh.coarse). A utility with a suffix is still
+    a utility — it must never stand in for a finished solver."""
+
+    def test_suffixed_utility_logs_are_not_a_solver(self, worker_module, run_dir):
+        for v in ("baseline", "coarse", "fine"):
+            _write(run_dir, f"output/log.blockMesh.{v}", COMPLETED_LOG)
+            _write(run_dir, f"output/log.checkMesh.{v}", COMPLETED_LOG)
+        r = worker_module._detect_solver_outcome(run_dir)
+        assert r["status"] == "unknown" and r["logs_checked"] == 0
+
+    def test_suffixed_solver_log_still_counts(self, worker_module, run_dir):
+        _write(run_dir, "output/log.checkMesh.fine", COMPLETED_LOG)
+        _write(run_dir, "output/log.interFoam.fine", RUNNING_LOG)
+        assert worker_module._detect_solver_outcome(run_dir)["status"] == "incomplete"

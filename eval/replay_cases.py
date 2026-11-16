@@ -46,7 +46,7 @@ UTILITY_LOGS = {"blockMesh", "snappyHexMesh", "checkMesh", "setFields", "decompo
 def solver_outcome(output: Path):
     """Same rule as worker._detect_solver_outcome: trust only the solver log."""
     logs = [p for p in output.rglob("log.*")
-            if p.is_file() and p.name[4:] not in UTILITY_LOGS]
+            if p.is_file() and p.name[4:].split(".")[0] not in UTILITY_LOGS]
     done = None
     for p in sorted(logs):
         tail = p.read_text(errors="replace")[-65536:]

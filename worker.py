@@ -1422,7 +1422,11 @@ def _detect_solver_outcome(run_dir):
         logs = []
         for root, _dirs, files in os.walk(run_dir or ''):
             for fn_ in files:
-                if fn_.startswith('log.') and fn_[4:] not in _OF_UTILITY_LOGS:
+                # log.<app>[.<variant>] — mesh studies write log.blockMesh.fine,
+                # log.checkMesh.coarse, ... The application is the part before
+                # the variant; matching the whole tail let a checkMesh log pass
+                # for a finished solver.
+                if fn_.startswith('log.') and fn_[4:].split('.')[0] not in _OF_UTILITY_LOGS:
                     logs.append(os.path.join(root, fn_))
         info['logs_checked'] = len(logs)
         completed = None
