@@ -254,6 +254,17 @@ def _diagnose_error_text(text, effective_provider, is_byok=False):
         'usage_limit_reached', 'usage limit has been reached',
         'http 429', 'error code: 429', 'status 429',
     ]):
+        # claude-bridge fronts the platform's own Claude subscription, so its
+        # limit is ours, not the user's: the bridge relays it as a 429 whose
+        # body carries `claude -p` ("You've hit your 5-hour limit · resets
+        # 12:30am"). Seen 2026-11-16 in a replay. Without this it read as a
+        # generic, billable rate_limit telling the user to change API keys.
+        if 'claude -p' in lower and not is_byok:
+            return (
+                "The platform's Claude (Opus/Sonnet) usage limit is reached; it resets within "
+                "a few hours. This run did not count toward your daily quota. Please try the "
+                "default model, or use BYOK with your own API key."
+            ), 'bridge_quota_exceeded'
         if effective_provider == 'openai-codex' and not is_byok:
             return (
                 "Platform Codex quota temporarily exhausted. "

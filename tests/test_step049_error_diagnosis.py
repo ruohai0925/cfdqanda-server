@@ -538,3 +538,25 @@ class TestQueueStatusEndpoint:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestBridgeQuota:
+    """Verbatim from a 2026-11-16 replay through claude-bridge."""
+
+    BRIDGE_LIMIT = ("openai.RateLimitError: Error code: 429 - {'error': {'message': 'claude -p rc=1: "
+                    "stderr=\\'\\' stdout=\"You\\'ve hit your 5-hour limit · resets 12:30am "
+                    "(America/New_York)\"', 'type': 'rate_limit_error'}}")
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, worker_module):
+        self.diagnose_text = worker_module[0]._diagnose_error_text
+
+    def test_bridge_limit_is_platform_quota(self):
+        # the worker maps claude-bridge to provider 'openai' before diagnosis
+        msg, cat = self.diagnose_text(self.BRIDGE_LIMIT, 'openai', is_byok=False)
+        assert cat == 'bridge_quota_exceeded'
+        assert 'did not count' in msg
+
+    def test_user_key_rate_limit_unchanged(self):
+        msg, cat = self.diagnose_text("openai.RateLimitError: Rate limit reached for gpt-5.5", 'openai', is_byok=True)
+        assert cat == 'rate_limit'

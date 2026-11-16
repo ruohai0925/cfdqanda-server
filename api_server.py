@@ -63,7 +63,7 @@ PLATFORM_REFUND_CATEGORIES = [
     # Added 2026-09-19 after the second case review: the claude-bridge OAuth
     # session expired and killed 3 jobs (#704/#705/#707) whose prompts were
     # fine — one of them succeeded verbatim on the default model minutes later.
-    'bridge_auth_error',
+    'bridge_auth_error', 'bridge_quota_exceeded',
     # Added 2026-11-15 with the Foam-Agent upgrade, which reports why a run
     # stopped. These two are the platform's side of that list: Foam-Agent could
     # not get its own environment ready, before the request was ever tried.
