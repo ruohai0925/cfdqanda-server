@@ -1442,9 +1442,126 @@ def _detect_solver_outcome(run_dir):
         logger.warning(f"_detect_solver_outcome failed (ignored): {e}")
     return info
 
+
+# Foam-Agent ends every run with one <workflow_end> line, and when it stops
+# early the line carries a machine-readable reason (src/main.py). Users only
+# ever saw "script failed with return code N"; translate the reasons into
+# something they can act on. Reasons that are the platform's fault rather than
+# the request's go to a refundable category.
+TERMINATION_REASONS = {
+    "repair_made_no_progress": ("repair_no_progress",
+        "Foam-Agent stopped repairing the case because its last fix changed nothing — "
+        "it has hit an error it cannot correct on its own. The workflow report and the "
+        "hints below show where it got stuck; a simpler or more fully specified request "
+        "(geometry, boundary conditions, solver) usually gets past it."),
+    "max_review_loop_reached": ("review_loop_exhausted",
+        "The case still failed after the maximum number of automatic review-and-fix "
+        "rounds. See the workflow report for the last error; tightening the request "
+        "(exact solver, boundary conditions, time step) usually helps."),
+    "mesh_review_stopped": ("review_loop_exhausted",
+        "Automatic mesh repair stopped without producing a usable mesh. Uploading a "
+        "mesh, or describing the geometry more precisely, usually helps."),
+    "solver_review_stopped": ("review_loop_exhausted",
+        "Automatic solver-setup repair stopped without a runnable case. See the "
+        "workflow report for the last error."),
+    "static_review_failed": ("static_review_failed",
+        "The generated case did not pass Foam-Agent's pre-run review, so it was not "
+        "executed. See the workflow report for what the review flagged."),
+    "preparation_failed": ("preparation_failed",
+        "Foam-Agent could not prepare the case. This is usually a platform-side "
+        "problem rather than your request — please try again."),
+    "invalid_review_response": ("llm_response_error",
+        "The model returned an unusable review and Foam-Agent stopped. This is a "
+        "transient model problem, not your request — please just resubmit."),
+    "agent_resources_unavailable": ("platform_resources",
+        "A platform resource Foam-Agent needs was unavailable. This is on our side — "
+        "please try again shortly."),
+}
+
+
+def _read_workflow_outcome(log_path):
+    """Parse Foam-Agent's closing lines: verdict, stop reason, report location."""
+    out = {"end": None, "partial_success": False, "termination_reason": None,
+           "report": None}
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return out
+    ends = _re.findall(r"<workflow_end>(.*?)</workflow_end>", text, _re.S)
+    if ends:
+        out["end"] = " ".join(ends[-1].split())
+        out["partial_success"] = "visualization failed" in out["end"]
+        m = _re.search(r"without completing successfully:\s*([a-z_]+)", out["end"])
+        if m:
+            out["termination_reason"] = m.group(1)
+    rep = _re.findall(r"<workflow_report>(.*?)</workflow_report>", text)
+    if rep:
+        out["report"] = rep[-1].strip()
+    return out
+
+
+
+def _decide_outcome(returncode, log_path, run_dir, provider, is_byok):
+    """Turn a finished Foam-Agent run into (status, error_category, message, extra).
+
+    status is 'completed' or 'failed'. Order matters:
+      1. exit 0, or Foam-Agent's partial success confirmed by the solver log
+      2. platform-side LLM failures (refundable) — Foam-Agent folds those into a
+         generic stop reason, e.g. an expired token shows up as preparation_failed
+      3. Foam-Agent's own stop reason
+      4. OOM kill
+      5. whatever the last <workflow_end> line said
+    """
+    outcome = _read_workflow_outcome(log_path)
+    report_rel = _report_relpath(run_dir, outcome["report"])
+    extra = {'workflow_report': report_rel} if report_rel else {}
+
+    partial = (returncode != 0 and outcome["partial_success"]
+               and _detect_solver_outcome(run_dir)["status"] == "completed")
+    if returncode == 0 or partial:
+        if partial:
+            extra.update({
+                'warning': ("The simulation finished successfully, but Foam-Agent could not "
+                            "generate the plots. The results themselves are complete."),
+                'warning_category': 'visualization_failed',
+            })
+        return 'completed', None, None, extra
+
+    extra['termination_reason'] = outcome["termination_reason"]
+    user_msg, err_cat = _diagnose_subprocess_failure(log_path, provider, is_byok)
+    if user_msg:
+        return 'failed', err_cat, user_msg, extra
+    if outcome["termination_reason"] in TERMINATION_REASONS:
+        cat, msg = TERMINATION_REASONS[outcome["termination_reason"]]
+        return 'failed', cat, msg, extra
+    if returncode in (-9, 137):
+        return 'failed', 'oom', ("Simulation was killed due to out-of-memory (OOM). "
+                                 "The mesh may be too large for single-core execution."), extra
+    msg = (f"Foam-Agent stopped: {outcome['end']}" if outcome["end"]
+           else f"Foam-Agent script failed with return code {returncode}.")
+    return 'failed', None, msg, extra
+
+def _report_relpath(run_dir, report_abs):
+    """Path of the HTML workflow report inside the task's file tree, if any."""
+    if not report_abs:
+        return None
+    try:
+        rel = os.path.relpath(report_abs, run_dir)
+    except ValueError:
+        return None
+    if rel.startswith("..") or not os.path.isfile(os.path.join(run_dir, rel)):
+        return None
+    return rel.replace(os.sep, "/")
+
 # Foam-Agent LangGraph node names, in pipeline order (src/main.py add_node calls).
-_PIPELINE_STAGES = ['planner', 'meshing', 'input_writer', 'local_runner',
-                    'hpc_runner', 'reviewer', 'visualization']
+# Node names after the 2026-11 split of planning/meshing/review. A later match
+# in the log wins, so substrings are harmless ('runner' also hits the
+# '<runner>' tag; 'static_review' also hits mesh_/solver_static_review).
+_PIPELINE_STAGES = ['preparation', 'meshing_planner', 'solver_planner',
+                    'standard_meshing', 'gmsh_meshing', 'custom_meshing',
+                    'input_writer', 'static_review', 'runner', 'local_runner',
+                    'hpc_runner', 'mesh_reviewer', 'solver_reviewer', 'visualization']
 
 
 def _summarize_progress(log_path, run_dir):
@@ -2302,6 +2419,16 @@ async def _mcp_stage_pre_run(job, pipeline_state, active_checkpoints):
             logger.info(f"Job {job_id}: applied fixes ({fix_result.get('status')}), "
                         f"retrying pre-run")
 
+        # Foam-Agent reports 'no_changes' when the repair rewrote nothing. The
+        # case is byte-identical to the one that just failed, so another pre-run
+        # can only reproduce the same error — stop now instead of waiting for
+        # the identical-errors streak above to notice two rounds later.
+        if fix_result.get('status') == 'no_changes':
+            logger.warning(f"Job {job_id}: apply_fixes made no changes — stopping fix loop")
+            _append_mcp_log(job_id, 'pre_run', "Fix made no changes — stopping")
+            no_progress_aborted = True
+            break
+
         _update_pipeline_state(job_id, 'pre_running', 'running', pipeline_state)
         executor = PreRunExecutor(case_dir, pre_run_end_time)
         checkpoint_data = executor.run(timeout=PRE_RUN_TIMEOUT)
@@ -2833,16 +2960,21 @@ def find_and_process_job():
         if custom_mesh_path:
             logger.info(f"Job {job_id}: custom mesh → {custom_mesh_path}")
 
-        # Config.__post_init__() reads FOAMAGENT_MODEL_PROVIDER/VERSION natively,
-        # so no need for the inspect-based patching hack anymore.
+        # Run Foam-Agent through its own CLI rather than importing its internals.
+        # Until 2026-11 this was `python -c "from main import main; main(...)"`,
+        # which broke silently on the upstream refactor: main() now *returns* a
+        # failed state instead of raising, so the import wrapper exited 0 for
+        # every failed workflow and the worker would have recorded each one as
+        # completed. The CLI turns the final state into an exit status itself
+        # (0 ok, 2 failed / partial, 1 crash) and is the interface upstream
+        # keeps stable. Config still reads FOAMAGENT_MODEL_PROVIDER/VERSION.
         command = [
-            "python", "-c",
-            "import os,sys; sys.path.insert(0,'src'); "
-            "from config import Config; from main import main; "
-            "c=Config(); c.case_dir=os.environ['FOAM_OUTPUT_DIR']; "
-            "main(open(os.environ['FOAM_PROMPT_PATH']).read(),c,"
-            "os.environ.get('FOAM_CUSTOM_MESH_PATH'))"
+            "python", "src/main.py",
+            "--prompt_path", os.path.abspath(prompt_path),
+            "--output_dir", os.path.abspath(output_path),
         ]
+        if custom_mesh_path:
+            command += ["--custom_mesh_path", os.path.abspath(custom_mesh_path)]
 
         logger.info(f"Executing command for job {job_id}: {' '.join(command)}")
         logger.info(f"Log file for this run will be at: {log_path}")
@@ -2873,28 +3005,20 @@ def find_and_process_job():
         allrun_audit = _run_allrun_audit(run_dir, job_id)
 
         # Handle completion based on return code
-        if returncode == 0:
-            logger.info(f"Job {job_id} Foam-Agent completed successfully.")
+        is_byok = bool(llm_config.get('api_key') or llm_config.get('codex_token'))
+        status, err_cat, error_msg, extra = _decide_outcome(
+            returncode, log_path, run_dir, effective_provider, is_byok)
+
+        if status == 'completed':
+            logger.info(f"Job {job_id} Foam-Agent completed successfully"
+                        f"{' (visualization failed)' if extra.get('warning') else ''}.")
             _upload_and_complete(
-                job_id, job['user_id'], run_dir, output_path, log_path, allrun_audit
+                job_id, job['user_id'], run_dir, output_path, log_path, allrun_audit,
+                extra_result=extra or None,
             )
         else:
-            logger.error(f"Job {job_id} failed. Check log file for details: {log_path}")
-            # Diagnose known error patterns from log
-            is_byok = bool(llm_config.get('api_key') or llm_config.get('codex_token'))
-            user_msg, err_cat = _diagnose_subprocess_failure(log_path, effective_provider, is_byok)
-            if user_msg:
-                logger.info(f"Job {job_id}: diagnosed failure as '{err_cat}'")
-                error_msg = user_msg
-            else:
-                error_msg = f"Foam-Agent script failed with return code {returncode}."
-                # Classify OOM (killed by signal 9)
-                if returncode == -9 or returncode == 137:
-                    err_cat = 'oom'
-                    error_msg = (
-                        "Simulation was killed due to out-of-memory (OOM). "
-                        "The mesh may be too large for single-core execution."
-                    )
+            logger.error(f"Job {job_id} failed (rc={returncode}, cat={err_cat}, "
+                         f"reason={extra.get('termination_reason')}). Log: {log_path}")
             _upload_and_fail(
                 job_id, job['user_id'],
                 error_msg,
@@ -2903,8 +3027,10 @@ def find_and_process_job():
                     'log_path_on_server': log_path,
                     'allrun_audit': allrun_audit,
                     'error_category': err_cat,
+                    'solver_outcome': _detect_solver_outcome(run_dir),
                     # 失败后案例体检(case_lint):把死因附近的可行动线索给到用户(warning-only)
                     'lint_hints': lint_hints(run_dir),
+                    **extra,
                 },
             )
 

@@ -64,6 +64,11 @@ PLATFORM_REFUND_CATEGORIES = [
     # session expired and killed 3 jobs (#704/#705/#707) whose prompts were
     # fine — one of them succeeded verbatim on the default model minutes later.
     'bridge_auth_error',
+    # Added 2026-11-15 with the Foam-Agent upgrade, which reports why a run
+    # stopped. These two are the platform's side of that list: Foam-Agent could
+    # not get its own environment ready, before the request was ever tried.
+    # (A failed repair or review loop is about the request, and stays billable.)
+    'preparation_failed', 'platform_resources',
 ]
 
 # --- Foam-Agent 目录配置 ---
