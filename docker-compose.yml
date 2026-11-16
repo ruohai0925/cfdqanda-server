@@ -110,7 +110,12 @@ services:
       replicas: 1    # Scale: docker compose up -d --scale worker=2
       resources:
         limits:
-          memory: 5G
+          # Per machine via .env. The resident embedding model and FAISS indices
+          # alone take ~3.8 GiB (measured 2026-11-15), so at 5G the solver gets
+          # ~1 GiB and long requirements can OOM during the first retrieval.
+          # With today's traffic, one worker with more memory beats two that
+          # can't fit a 3D case.
+          memory: ${WORKER_MEMORY_LIMIT:-5G}
         reservations:
           memory: 3G
     logging:
