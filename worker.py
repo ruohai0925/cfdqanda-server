@@ -1238,8 +1238,71 @@ def _get_dir_size_bytes(path):
     return total
 
 
+# --- Live progress for auto mode ---
+# Foam-Agent prints a marker as each node starts. Auto-mode jobs used to show
+# nothing but "running" for 5-40+ minutes; the worker now tails the log and
+# writes a coarse stage to `pipeline_stage` (prefixed auto_, which no
+# controlled-mode code reads), plus the repair round as auto_repairing:<n>.
+_AUTO_PROGRESS_MARKERS = [
+    (_re.compile(r'^<case_import>'), 'auto_import'),
+    (_re.compile(r'^<mesh_reference>'), 'auto_meshing'),
+    (_re.compile(r'^<mesh_static_review>'), 'auto_meshing'),
+    (_re.compile(r'^Executing script .*/Allmesh\b'), 'auto_meshing'),
+    (_re.compile(r'^<solver_planner>'), 'auto_setup'),
+    (_re.compile(r'^<input_writer mode="initial">'), 'auto_setup'),
+    (_re.compile(r'^<solver_static_review>'), 'auto_setup'),
+    (_re.compile(r'^<runner>'), 'auto_running'),
+    (_re.compile(r'^<input_writer mode="rewrite">'), 'auto_repairing'),
+    (_re.compile(r'^<visualization>'), 'auto_visualizing'),
+]
+AUTO_PROGRESS_INTERVAL = int(os.environ.get("AUTO_PROGRESS_INTERVAL", "15"))
+
+
+class _AutoProgress:
+    """Incrementally scan a growing Foam-Agent log for the current stage."""
+
+    def __init__(self, log_path):
+        self.log_path = log_path
+        self.offset = 0
+        self.partial = ''
+        self.stage = None
+        self.repairs = 0
+
+    def poll(self):
+        """Read new log text; return the stage label ('auto_repairing:2' style)."""
+        try:
+            with open(self.log_path, 'r', errors='replace') as f:
+                f.seek(self.offset)
+                chunk = f.read()
+                self.offset = f.tell()
+        except OSError:
+            return self.label()
+        lines = (self.partial + chunk).split('\n')
+        self.partial = lines.pop()          # keep an unfinished last line
+        for line in lines:
+            for pattern, stage in _AUTO_PROGRESS_MARKERS:
+                if pattern.match(line):
+                    if stage == 'auto_repairing':
+                        self.repairs += 1
+                    self.stage = stage
+                    break
+        return self.label()
+
+    def label(self):
+        if self.stage == 'auto_repairing':
+            return f'auto_repairing:{self.repairs}'
+        return self.stage
+
+
+def _publish_auto_stage(job_id, stage):
+    try:
+        supabase.table('simulations').update({'pipeline_stage': stage}).eq('id', job_id).execute()
+    except Exception as e:  # progress is cosmetic; never fail a run over it
+        logger.warning(f"Job {job_id}: could not publish progress {stage}: {e}")
+
+
 def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout,
-                                 run_dir=None):
+                                 run_dir=None, on_progress=None):
     """
     Run a subprocess with polling for timeout, cancellation, and disk usage.
 
@@ -1261,6 +1324,8 @@ def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout,
 
         start_time = time.time()
         last_disk_check = 0
+        progress = _AutoProgress(log_path) if on_progress else None
+        last_progress_check, published = 0, None
         cancelled = False
         timed_out = False
         disk_exceeded = False
@@ -1282,6 +1347,13 @@ def _run_subprocess_with_polling(command, cwd, env, log_path, job_id, timeout,
                 logger.info(f"Job {job_id}: cancellation detected, terminating subprocess...")
                 _kill_process_tree(process)
                 break
+
+            if progress and (elapsed - last_progress_check) >= AUTO_PROGRESS_INTERVAL:
+                last_progress_check = elapsed
+                stage = progress.poll()
+                if stage and stage != published:
+                    published = stage
+                    on_progress(stage)
 
             # Periodic disk usage check
             if run_dir and (elapsed - last_disk_check) >= DISK_CHECK_INTERVAL:
@@ -3146,6 +3218,7 @@ def find_and_process_job():
 
         # Run Foam-Agent subprocess with polling
         returncode, cancelled, timed_out, disk_exceeded = _run_subprocess_with_polling(
+            on_progress=lambda stage: _publish_auto_stage(job_id, stage),
             command=command,
             cwd=FOAM_AGENT_DIR,
             env=child_env,
